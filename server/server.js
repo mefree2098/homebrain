@@ -15,7 +15,7 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan('dev'));
 
-// Connect to DB
+// Connect to DB (but don't crash the whole process if missing during first run)
 connectDB();
 
 // Basic routes

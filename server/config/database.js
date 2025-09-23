@@ -3,9 +3,15 @@ require('dotenv').config();
 
 const connectDB = async () => {
   try {
-    const conn = await mongoose.connect(process.env.DATABASE_URL);
+    // Support both DATABASE_URL and MONGODB_URI, with a sensible default
+    const uri = process.env.DATABASE_URL || process.env.MONGODB_URI || 'mongodb://localhost:27017/homebrain';
+    if (!uri) {
+      throw new Error('No MongoDB connection string found in env (DATABASE_URL or MONGODB_URI)');
+    }
 
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
+    const conn = await mongoose.connect(uri);
+
+    console.log(`MongoDB Connected: ${conn.connection.host}/${conn.connection.name}`);
 
     // Error handling after initial connection
     mongoose.connection.on('error', err => {
@@ -33,7 +39,7 @@ const connectDB = async () => {
     });
 
   } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.error(`MongoDB connection failed: ${error.message}`);
     process.exit(1);
   }
 };
