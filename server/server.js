@@ -50,6 +50,40 @@ let securityStatus = {
   lastTriggered: null,
 };
 
+// In-memory app settings (dev defaults)
+let appSettings = {
+  location: 'New York, NY',
+  timezone: 'America/New_York',
+  wakeWordSensitivity: 0.7,
+  voiceVolume: 0.8,
+  microphoneSensitivity: 0.6,
+  enableVoiceConfirmation: true,
+  enableNotifications: true,
+  insteonPort: '/dev/ttyUSB0',
+  smartthingsToken: '', // legacy
+  smartthingsClientId: '',
+  smartthingsClientSecret: '',
+  smartthingsRedirectUri: '',
+  elevenlabsApiKey: '',
+  llmProvider: 'openai',
+  openaiApiKey: '',
+  openaiModel: 'gpt-4',
+  anthropicApiKey: '',
+  anthropicModel: 'claude-3-sonnet-20240229',
+  localLlmEndpoint: 'http://localhost:8080',
+  localLlmModel: 'llama2-7b',
+  enableSecurityMode: false,
+};
+
+let smartthingsIntegration = {
+  isConfigured: false,
+  isConnected: false,
+  clientId: '',
+  clientSecret: '',
+  redirectUri: '',
+  deviceCount: 0,
+};
+
 // Basic routes
 app.get('/api/ping', (req, res) => {
   res.json({ status: 'ok' });
@@ -143,6 +177,20 @@ app.post('/api/scenes/activate', (req, res) => {
 });
 
 // Voice
+app.get('/api/voice/status', (req, res) => {
+  const online = voiceDevices.filter(v => v.status === 'online').length;
+  res.json({
+    listening: true,
+    connected: online > 0,
+    activeDevices: online,
+    totalDevices: voiceDevices.length,
+    deviceStats: {
+      online,
+      offline: voiceDevices.length - online,
+    }
+  });
+});
+
 app.get('/api/voice/devices', (req, res) => {
   res.json({ success: true, devices: voiceDevices, count: voiceDevices.length });
 });
@@ -175,6 +223,282 @@ app.post('/api/security-alarm/disarm', (req, res) => {
 app.post('/api/security-alarm/sync', (req, res) => {
   // Demo: pretend to sync with SmartThings
   res.json({ success: true, message: 'Synced with SmartThings', alarm: { _id: 'alarm-1', alarmState: securityStatus.alarmState, isOnline: securityStatus.isOnline } });
+});
+
+// Settings
+app.get('/api/settings', (req, res) => {
+  // Mask sensitive fields when returning
+  const masked = {
+    ...appSettings,
+    elevenlabsApiKey: appSettings.elevenlabsApiKey ? '************************' : '',
+    smartthingsToken: appSettings.smartthingsToken ? '************************' : '',
+    smartthingsClientSecret: appSettings.smartthingsClientSecret ? '************************' : '',
+    openaiApiKey: appSettings.openaiApiKey ? '************************' : '',
+    anthropicApiKey: appSettings.anthropicApiKey ? '************************' : '',
+  };
+  res.json({ success: true, settings: masked });
+});
+
+app.put('/api/settings', (req, res) => {
+  // Only update provided fields; preserve sensitive placeholders
+  const updates = req.body || {};
+  const sensitive = new Set(['elevenlabsApiKey','smartthingsToken','smartthingsClientSecret','openaiApiKey','anthropicApiKey']);
+  for (const [k, v] of Object.entries(updates)) {
+    if (sensitive.has(k) && typeof v === 'string' && v.startsWith('•')) continue; // ignore placeholders
+    appSettings[k] = v;
+  }
+  res.json({ success: true, message: 'Settings updated', settings: appSettings });
+});
+
+app.get('/api/settings/:key', (req, res) => {
+  const key = req.params.key;
+  if (!(key in appSettings)) return res.status(404).json({ success: false, message: 'Setting not found' });
+  res.json({ success: true, key, value: appSettings[key] });
+});
+
+// SmartThings mock endpoints used by Settings page
+app.get('/api/smartthings/status', (req, res) => {
+  res.json({ success: true, integration: smartthingsIntegration });
+});
+
+app.post('/api/smartthings/configure', (req, res) => {
+  const { clientId, clientSecret, redirectUri } = req.body || {};
+  if (!clientId || !clientSecret) return res.status(400).json({ success: false, message: 'Client ID and secret required' });
+  smartthingsIntegration.isConfigured = true;
+  smartthingsIntegration.clientId = clientId;
+  smartthingsIntegration.clientSecret = clientSecret ? '************************' : '';
+  smartthingsIntegration.redirectUri = redirectUri || '';
+  res.json({ success: true, message: 'SmartThings OAuth configured' });
+});
+
+app.get('/api/smartthings/auth/url', (req, res) => {
+  if (!smartthingsIntegration.isConfigured) return res.status(400).json({ success: false, message: 'OAuth not configured' });
+  // For demo, just echo a placeholder URL
+  res.json({ success: true, authUrl: 'https://account.smartthings.com/oauth/authorize?demo=true' });
+});
+
+app.post('/api/smartthings/test', (req, res) => {
+  // Pretend test succeeded
+  res.json({ success: true, message: 'SmartThings connection OK', deviceCount: smartthingsIntegration.deviceCount });
+});
+
+app.post('/api/smartthings/disconnect', (req, res) => {
+  smartthingsIntegration = { isConfigured: false, isConnected: false, clientId: '', clientSecret: '', redirectUri: '', deviceCount: 0 };
+  res.json({ success: true, message: 'SmartThings disconnected' });
+});
+
+// Maintenance mock endpoints used by Settings page
+app.post('/api/maintenance/clear-fake-data', (req, res) => {
+  const results = { devices: devices.length, scenes: scenes.length, voiceDevices: voiceDevices.length };
+  devices = [];
+  scenes = [];
+  voiceDevices = [];
+  res.json({ success: true, results });
+});
+
+app.post('/api/maintenance/inject-fake-data', (req, res) => {
+  devices = [
+    { _id: 'dev-1', name: 'Living Room Lamp', type: 'light', room: 'Living Room', status: true, brightness: 70 },
+    { _id: 'dev-2', name: 'Hallway Thermostat', type: 'thermostat', room: 'Hallway', status: true, temperature: 72 },
+    { _id: 'dev-3', name: 'Front Door Lock', type: 'lock', room: 'Entry', status: true },
+    { _id: 'dev-4', name: 'Bedroom Lamp', type: 'light', room: 'Bedroom', status: false, brightness: 0 },
+  ];
+  scenes = [
+    { _id: 'scene-1', name: 'Movie Night', description: 'Dim lights, set temp to 70', devices: ['dev-1', 'dev-2'], active: false },
+    { _id: 'scene-2', name: 'Good Morning', description: 'Turn on lights, set temp to 72', devices: ['dev-1', 'dev-4', 'dev-2'], active: false },
+  ];
+  voiceDevices = [
+    { _id: 'voice-1', name: 'Kitchen Speaker', room: 'Kitchen', deviceType: 'speaker', status: 'online', lastSeen: new Date().toISOString(), powerSource: 'AC', connectionType: 'wifi', ipAddress: '192.168.1.20', volume: 60, microphoneSensitivity: 70, uptime: 3600 },
+    { _id: 'voice-2', name: 'Bedroom Speaker', room: 'Bedroom', deviceType: 'speaker', status: 'offline', lastSeen: new Date(Date.now() - 3600_000).toISOString(), powerSource: 'AC', connectionType: 'wifi', volume: 40, microphoneSensitivity: 60, uptime: 0 },
+  ];
+  res.json({ success: true, results: { devices: devices.length, scenes: scenes.length, voiceDevices: voiceDevices.length } });
+});
+
+app.post('/api/maintenance/smartthings/sync', (req, res) => {
+  smartthingsIntegration.deviceCount = 5;
+  res.json({ success: true, deviceCount: smartthingsIntegration.deviceCount });
+});
+
+app.post('/api/maintenance/insteon/sync', (req, res) => {
+  res.json({ success: true, message: 'INSTEON sync started (demo)' });
+});
+
+app.post('/api/maintenance/smartthings/clear-devices', (req, res) => {
+  const deletedCount = smartthingsIntegration.deviceCount;
+  smartthingsIntegration.deviceCount = 0;
+  res.json({ success: true, deletedCount });
+});
+
+app.post('/api/maintenance/reset-settings', (req, res) => {
+  appSettings.enableSecurityMode = false;
+  res.json({ success: true });
+});
+
+app.post('/api/maintenance/smartthings/clear', (req, res) => {
+  smartthingsIntegration = { isConfigured: false, isConnected: false, clientId: '', clientSecret: '', redirectUri: '', deviceCount: 0 };
+  res.json({ success: true });
+});
+
+app.post('/api/maintenance/voice/clear', (req, res) => {
+  const deletedCount = 12; // demo
+  res.json({ success: true, deletedCount });
+});
+
+app.get('/api/maintenance/health', (req, res) => {
+  const online = voiceDevices.filter(v => v.status === 'online').length;
+  res.json({
+    success: true,
+    health: {
+      database: {
+        collections: {
+          devices: devices.length,
+          scenes: scenes.length,
+          automations: 0,
+          voiceDevices: voiceDevices.length,
+          userProfiles: 0,
+        }
+      },
+      devices: {
+        total: devices.length,
+        online: devices.filter(d => d.status).length,
+        offline: devices.filter(d => !d.status).length,
+      },
+      voiceSystem: {
+        online,
+        devices: voiceDevices.length,
+      },
+      integrations: {
+        smartthings: {
+          connected: smartthingsIntegration.isConnected,
+        }
+      }
+    }
+  });
+});
+
+// --- Alias routes to match client API definitions ---
+// Maintenance aliases
+app.delete('/api/maintenance/fake-data', (req, res) => {
+  const results = { devices: devices.length, scenes: scenes.length, automations: 0, voiceDevices: voiceDevices.length, userProfiles: 0, voiceCommands: 0, securityAlarms: 0 };
+  devices = [];
+  scenes = [];
+  voiceDevices = [];
+  res.json({ success: true, message: 'Fake data cleared', results });
+});
+
+app.post('/api/maintenance/fake-data', (req, res) => {
+  devices = [
+    { _id: 'dev-1', name: 'Living Room Lamp', type: 'light', room: 'Living Room', status: true, brightness: 70 },
+    { _id: 'dev-2', name: 'Hallway Thermostat', type: 'thermostat', room: 'Hallway', status: true, temperature: 72 },
+    { _id: 'dev-3', name: 'Front Door Lock', type: 'lock', room: 'Entry', status: true },
+    { _id: 'dev-4', name: 'Bedroom Lamp', type: 'light', room: 'Bedroom', status: false, brightness: 0 },
+  ];
+  scenes = [
+    { _id: 'scene-1', name: 'Movie Night', description: 'Dim lights, set temp to 70', devices: ['dev-1', 'dev-2'], active: false },
+    { _id: 'scene-2', name: 'Good Morning', description: 'Turn on lights, set temp to 72', devices: ['dev-1', 'dev-4', 'dev-2'], active: false },
+  ];
+  voiceDevices = [
+    { _id: 'voice-1', name: 'Kitchen Speaker', room: 'Kitchen', deviceType: 'speaker', status: 'online', lastSeen: new Date().toISOString(), powerSource: 'AC', connectionType: 'wifi', ipAddress: '192.168.1.20', volume: 60, microphoneSensitivity: 70, uptime: 3600 },
+    { _id: 'voice-2', name: 'Bedroom Speaker', room: 'Bedroom', deviceType: 'speaker', status: 'offline', lastSeen: new Date(Date.now() - 3600_000).toISOString(), powerSource: 'AC', connectionType: 'wifi', volume: 40, microphoneSensitivity: 60, uptime: 0 },
+  ];
+  res.json({ success: true, message: 'Fake data injected', results: { devices: devices.length, scenes: scenes.length, automations: 0, voiceDevices: voiceDevices.length, userProfiles: 0 } });
+});
+
+app.post('/api/maintenance/sync/smartthings', (req, res) => {
+  smartthingsIntegration.deviceCount = 5;
+  res.json({ success: true, message: 'SmartThings sync started (demo)', deviceCount: smartthingsIntegration.deviceCount });
+});
+
+app.post('/api/maintenance/sync/insteon', (req, res) => {
+  res.json({ success: true, message: 'INSTEON sync started (demo)' });
+});
+
+app.delete('/api/maintenance/devices/smartthings', (req, res) => {
+  const deletedCount = smartthingsIntegration.deviceCount;
+  smartthingsIntegration.deviceCount = 0;
+  res.json({ success: true, message: 'SmartThings devices cleared', deletedCount });
+});
+
+app.delete('/api/maintenance/devices/insteon', (req, res) => {
+  res.json({ success: true, message: 'INSTEON devices cleared', deletedCount: 0 });
+});
+
+app.post('/api/maintenance/reset/settings', (req, res) => {
+  appSettings.enableSecurityMode = false;
+  res.json({ success: true, message: 'Settings reset to defaults' });
+});
+
+app.delete('/api/maintenance/integrations/smartthings', (req, res) => {
+  smartthingsIntegration = { isConfigured: false, isConnected: false, clientId: '', clientSecret: '', redirectUri: '', deviceCount: 0 };
+  res.json({ success: true, message: 'SmartThings integration cleared' });
+});
+
+app.delete('/api/maintenance/voice-commands', (req, res) => {
+  const deletedCount = 12; // demo
+  res.json({ success: true, message: 'Voice commands cleared', deletedCount });
+});
+
+app.get('/api/maintenance/export', (req, res) => {
+  const config = { appSettings, smartthingsIntegration, devices, scenes, voiceDevices };
+  res.json({ success: true, message: 'Export generated', config });
+});
+
+// Settings test endpoints
+app.post('/api/settings/test-elevenlabs', (req, res) => {
+  const { apiKey } = req.body || {};
+  if (!apiKey) return res.status(400).json({ success: false, message: 'apiKey required' });
+  res.json({ success: true, message: 'ElevenLabs key OK (demo)', voiceCount: 5 });
+});
+
+app.post('/api/settings/test-openai', (req, res) => {
+  const { apiKey, model } = req.body || {};
+  if (!apiKey) return res.status(400).json({ success: false, message: 'apiKey required' });
+  res.json({ success: true, message: 'OpenAI key OK (demo)', model: model || appSettings.openaiModel });
+});
+
+app.post('/api/settings/test-anthropic', (req, res) => {
+  const { apiKey, model } = req.body || {};
+  if (!apiKey) return res.status(400).json({ success: false, message: 'apiKey required' });
+  res.json({ success: true, message: 'Anthropic key OK (demo)', model: model || appSettings.anthropicModel });
+});
+
+app.post('/api/settings/test-local-llm', (req, res) => {
+  const { endpoint, model } = req.body || {};
+  if (!endpoint) return res.status(400).json({ success: false, message: 'endpoint required' });
+  res.json({ success: true, message: 'Local LLM reachable (demo)', endpoint, model: model || appSettings.localLlmModel });
+});
+
+// Additional voice endpoints for completeness
+app.post('/api/voice/test', (req, res) => {
+  const { deviceId } = req.body || {};
+  const device = deviceId ? voiceDevices.find(v => v._id === deviceId) : null;
+  res.json({ success: true, message: 'Test played (demo)', deviceName: device?.name || 'All Devices', room: device?.room || 'All Rooms', testResults: { ok: true } });
+});
+
+app.get('/api/voice/devices/:id', (req, res) => {
+  const device = voiceDevices.find(v => v._id === req.params.id);
+  if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+  res.json({ success: true, device });
+});
+
+app.put('/api/voice/devices/:id/status', (req, res) => {
+  const device = voiceDevices.find(v => v._id === req.params.id);
+  if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+  const { status } = req.body || {};
+  device.status = status || device.status;
+  res.json({ success: true, message: 'Status updated', device });
+});
+
+app.get('/api/voice/devices/room/:room', (req, res) => {
+  const room = decodeURIComponent(req.params.room);
+  const devicesInRoom = voiceDevices.filter(v => v.room === room);
+  res.json({ success: true, devices: devicesInRoom, room, count: devicesInRoom.length });
+});
+
+app.get('/api/voice/devices/status/:status', (req, res) => {
+  const status = req.params.status;
+  const list = voiceDevices.filter(v => v.status === status);
+  res.json({ success: true, devices: list, status, count: list.length });
 });
 
 // Start HTTP server
