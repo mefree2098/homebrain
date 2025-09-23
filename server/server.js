@@ -3,9 +3,12 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 const http = require('http');
+const mongoose = require('mongoose');
+const fs = require('fs');
 require('dotenv').config();
 
 const { connectDB } = require('./config/database');
+const SettingsModel = require('./models/Settings');
 
 // Create Express app
 const app = express();
@@ -83,6 +86,81 @@ let smartthingsIntegration = {
   redirectUri: '',
   deviceCount: 0,
 };
+
+// --- Settings persistence helpers (DB if available, else JSON file) ---
+const dataDir = path.join(__dirname, 'data');
+const settingsFilePath = path.join(dataDir, 'settings.json');
+
+function ensureDataDir() {
+  try {
+    if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
+  } catch (e) {
+    console.warn('Failed to ensure data directory:', e.message);
+  }
+}
+
+function isDbConnected() {
+  return mongoose.connection && mongoose.connection.readyState === 1;
+}
+
+async function readSettingsPersisted() {
+  // Prefer DB if connected
+  if (isDbConnected()) {
+    try {
+      const doc = await SettingsModel.getSettings();
+      return doc.toObject();
+    } catch (e) {
+      console.warn('readSettingsPersisted(DB) failed, falling back to file:', e.message);
+    }
+  }
+  // Fallback to file
+  try {
+    if (fs.existsSync(settingsFilePath)) {
+      const raw = fs.readFileSync(settingsFilePath, 'utf-8');
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.warn('readSettingsPersisted(file) failed:', e.message);
+  }
+  // Fallback to current in-memory defaults
+  return { ...appSettings };
+}
+
+async function writeSettingsPersisted(updates) {
+  // Merge with current persisted state
+  const current = await readSettingsPersisted();
+  const next = { ...current, ...updates };
+
+  // Try DB if connected
+  if (isDbConnected()) {
+    try {
+      const sensitive = new Set(['elevenlabsApiKey','smartthingsToken','smartthingsClientSecret','openaiApiKey','anthropicApiKey']);
+      // If placeholders were passed, drop them
+      for (const [k, v] of Object.entries(next)) {
+        if (sensitive.has(k) && typeof v === 'string' && v.startsWith('•')) delete next[k];
+      }
+      const saved = await SettingsModel.updateSettings(next);
+      return saved.toObject();
+    } catch (e) {
+      console.warn('writeSettingsPersisted(DB) failed, falling back to file:', e.message);
+    }
+  }
+
+  // File persistence
+  try {
+    ensureDataDir();
+    fs.writeFileSync(settingsFilePath, JSON.stringify(next, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('writeSettingsPersisted(file) failed:', e.message);
+  }
+  return next;
+}
+
+// Initialize in-memory appSettings from persisted store at startup
+(async () => {
+  const persisted = await readSettingsPersisted();
+  appSettings = { ...appSettings, ...persisted };
+})();
 
 // Basic routes
 app.get('/api/ping', (req, res) => {
@@ -239,15 +317,17 @@ app.get('/api/settings', (req, res) => {
   res.json({ success: true, settings: masked });
 });
 
-app.put('/api/settings', (req, res) => {
-  // Only update provided fields; preserve sensitive placeholders
-  const updates = req.body || {};
-  const sensitive = new Set(['elevenlabsApiKey','smartthingsToken','smartthingsClientSecret','openaiApiKey','anthropicApiKey']);
-  for (const [k, v] of Object.entries(updates)) {
-    if (sensitive.has(k) && typeof v === 'string' && v.startsWith('•')) continue; // ignore placeholders
-    appSettings[k] = v;
+app.put('/api/settings', async (req, res) => {
+  try {
+    const updates = req.body || {};
+    const saved = await writeSettingsPersisted(updates);
+    // Refresh in-memory settings
+    appSettings = { ...appSettings, ...saved };
+    res.json({ success: true, message: 'Settings updated', settings: appSettings });
+  } catch (e) {
+    console.error('PUT /api/settings failed:', e);
+    res.status(500).json({ success: false, message: 'Failed to update settings' });
   }
-  res.json({ success: true, message: 'Settings updated', settings: appSettings });
 });
 
 app.get('/api/settings/:key', (req, res) => {
