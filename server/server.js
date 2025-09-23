@@ -501,17 +501,33 @@ app.get('/api/voice/devices/status/:status', (req, res) => {
   res.json({ success: true, devices: list, status, count: list.length });
 });
 
-// Start HTTP server
+// Lightweight log sink to silence localhost:4444/logs POSTs
+app.post('/logs', (req, res) => {
+  // No-op: accept any log payload and return 204
+  res.status(204).end();
+});
+
+// Start HTTP servers
 const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 server.listen(PORT, () => {
   console.log(`HomeBrain API listening on port ${PORT}`);
 });
 
+// Also listen on 4444 for /logs (and other routes if hit)
+const LOG_PORT = Number(process.env.LOG_PORT || 4444);
+const logServer = http.createServer(app);
+logServer.listen(LOG_PORT, () => {
+  console.log(`Log sink listening on port ${LOG_PORT}`);
+});
+
 // Graceful shutdown
 process.on('SIGINT', () => {
   server.close(() => {
     console.log('HTTP server closed');
-    process.exit(0);
+    logServer.close(() => {
+      console.log('Log server closed');
+      process.exit(0);
+    });
   });
 });
