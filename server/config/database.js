@@ -39,8 +39,8 @@ const connectDB = async () => {
     });
 
   } catch (error) {
-    console.error(`MongoDB connection failed: ${error.message}`);
-    process.exit(1);
+    console.error(`MongoDB connection failed (continuing without DB): ${error.message}`);
+    // Do NOT exit the process; allow API to run with in-memory data for dev
   }
 };
 
