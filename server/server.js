@@ -7,8 +7,12 @@ const mongoose = require('mongoose');
 const fs = require('fs');
 require('dotenv').config();
 
-const { connectDB } = require('./config/database');
+const { connectDB, closeDB } = require('./config/database');
 const SettingsModel = require('./models/Settings');
+
+let server;
+let logServer;
+let isShuttingDown = false;
 
 // Create Express app
 const app = express();
@@ -19,7 +23,7 @@ app.use(express.json({ limit: '2mb' }));
 app.use(morgan('dev'));
 
 // Connect to DB (but don't crash the whole process if missing during first run)
-connectDB();
+// Connection is established during bootstrap() so we can await it safely.
 
 // In-memory demo data so the UI can load
 let devices = [
@@ -127,40 +131,43 @@ async function readSettingsPersisted() {
 }
 
 async function writeSettingsPersisted(updates) {
-  // Merge with current persisted state
   const current = await readSettingsPersisted();
-  const next = { ...current, ...updates };
+  const sensitive = new Set(['elevenlabsApiKey','smartthingsToken','smartthingsClientSecret','openaiApiKey','anthropicApiKey']);
+  const merged = { ...current, ...updates };
+  const placeholderPattern = /^+/;
 
-  // Try DB if connected
-  if (isDbConnected()) {
-    try {
-      const sensitive = new Set(['elevenlabsApiKey','smartthingsToken','smartthingsClientSecret','openaiApiKey','anthropicApiKey']);
-      // If placeholders were passed, drop them
-      for (const [k, v] of Object.entries(next)) {
-        if (sensitive.has(k) && typeof v === 'string' && v.startsWith('•')) delete next[k];
+  for (const key of sensitive) {
+    const incoming = updates[key];
+    if (typeof incoming === 'string' && placeholderPattern.test(incoming)) {
+      if (current[key] !== undefined) {
+        merged[key] = current[key];
+      } else {
+        delete merged[key];
       }
-      const saved = await SettingsModel.updateSettings(next);
-      return saved.toObject();
-    } catch (e) {
-      console.warn('writeSettingsPersisted(DB) failed, falling back to file:', e.message);
     }
   }
 
-  // File persistence
+  let persisted = merged;
+
+  if (isDbConnected()) {
+    try {
+      const saved = await SettingsModel.updateSettings(merged);
+      persisted = saved.toObject();
+    } catch (e) {
+      console.warn('writeSettingsPersisted(DB) failed, continuing with file persistence only:', e.message);
+    }
+  }
+
   try {
     ensureDataDir();
-    fs.writeFileSync(settingsFilePath, JSON.stringify(next, null, 2), 'utf-8');
+    fs.writeFileSync(settingsFilePath, JSON.stringify(persisted, null, 2), 'utf-8');
   } catch (e) {
     console.error('writeSettingsPersisted(file) failed:', e.message);
   }
-  return next;
-}
 
+  return persisted;
+}
 // Initialize in-memory appSettings from persisted store at startup
-(async () => {
-  const persisted = await readSettingsPersisted();
-  appSettings = { ...appSettings, ...persisted };
-})();
 
 // Basic routes
 app.get('/api/ping', (req, res) => {
@@ -588,26 +595,57 @@ app.post('/logs', (req, res) => {
 });
 
 // Start HTTP servers
-const PORT = process.env.PORT || 3000;
-const server = http.createServer(app);
-server.listen(PORT, () => {
-  console.log(`HomeBrain API listening on port ${PORT}`);
-});
+async function bootstrap() {
+  try {
+    await connectDB();
+    const persisted = await readSettingsPersisted();
+    appSettings = { ...appSettings, ...persisted };
 
-// Also listen on 4444 for /logs (and other routes if hit)
-const LOG_PORT = Number(process.env.LOG_PORT || 4444);
-const logServer = http.createServer(app);
-logServer.listen(LOG_PORT, () => {
-  console.log(`Log sink listening on port ${LOG_PORT}`);
-});
+    const PORT = process.env.PORT || 3000;
+    server = http.createServer(app);
+    await new Promise(resolve => server.listen(PORT, resolve));
+    console.log(`HomeBrain API listening on port ${PORT}`);
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  server.close(() => {
-    console.log('HTTP server closed');
-    logServer.close(() => {
+    const LOG_PORT = Number(process.env.LOG_PORT || 4444);
+    logServer = http.createServer(app);
+    await new Promise(resolve => logServer.listen(LOG_PORT, resolve));
+    console.log(`Log sink listening on port ${LOG_PORT}`);
+  } catch (err) {
+    console.error('Failed to bootstrap HomeBrain server:', err);
+    process.exit(1);
+  }
+}
+
+bootstrap();
+
+async function shutdown() {
+  if (isShuttingDown) {
+    return;
+  }
+  isShuttingDown = true;
+  try {
+    if (server) {
+      await new Promise(resolve => server.close(resolve));
+      console.log('HTTP server closed');
+    }
+    if (logServer) {
+      await new Promise(resolve => logServer.close(resolve));
       console.log('Log server closed');
-      process.exit(0);
-    });
-  });
+    }
+    await closeDB();
+    process.exit(0);
+  } catch (err) {
+    console.error('Error during shutdown:', err);
+    process.exit(1);
+  }
+}
+
+process.on('SIGINT', () => {
+  shutdown();
 });
+
+
+process.on('SIGTERM', () => {
+  shutdown();
+});
+

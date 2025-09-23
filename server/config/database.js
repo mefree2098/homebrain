@@ -25,25 +25,25 @@ const connectDB = async () => {
     mongoose.connection.on('reconnected', () => {
       console.info('MongoDB reconnected');
     });
-
-    // Graceful shutdown
-    process.on('SIGINT', async () => {
-      try {
-        await mongoose.connection.close();
-        console.log('MongoDB connection closed through app termination');
-        process.exit(0);
-      } catch (err) {
-        console.error('Error during MongoDB shutdown:', err);
-        process.exit(1);
-      }
-    });
-
   } catch (error) {
     console.error(`MongoDB connection failed (continuing without DB): ${error.message}`);
     // Do NOT exit the process; allow API to run with in-memory data for dev
   }
 };
 
+const closeDB = async () => {
+  if (mongoose.connection.readyState === 0) {
+    return;
+  }
+  try {
+    await mongoose.connection.close();
+    console.log('MongoDB connection closed');
+  } catch (err) {
+    console.error('Error closing MongoDB connection:', err);
+  }
+};
+
 module.exports = {
   connectDB,
+  closeDB,
 };

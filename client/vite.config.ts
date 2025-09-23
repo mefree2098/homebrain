@@ -17,7 +17,7 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/logs': {
-        target: 'http://localhost:4444',
+        target: 'http://localhost:3000',
         changeOrigin: true,
       }
     },
@@ -30,3 +30,4 @@ export default defineConfig({
     }
   },
 })
+
