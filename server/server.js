@@ -237,12 +237,42 @@ const isMaskedPlaceholderValue = (value) => {
 
 const dataDir = path.join(__dirname, 'data');
 const settingsFilePath = path.join(dataDir, 'settings.json');
+const profilesFilePath = path.join(dataDir, 'user-profiles.json');
 
 const ensureDataDir = () => {
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true });
   }
 };
+
+const readUserProfilesFromDisk = () => {
+  try {
+    if (fs.existsSync(profilesFilePath)) {
+      const raw = fs.readFileSync(profilesFilePath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed;
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to read user profiles from disk:', error.message);
+  }
+  return null;
+};
+
+const writeUserProfilesToDisk = (profiles) => {
+  try {
+    ensureDataDir();
+    fs.writeFileSync(profilesFilePath, JSON.stringify(profiles, null, 2), 'utf-8');
+  } catch (error) {
+    console.warn('Failed to write user profiles to disk:', error.message);
+  }
+};
+
+const persistedUserProfiles = readUserProfilesFromDisk();
+if (Array.isArray(persistedUserProfiles)) {
+  memoryStore.userProfiles = persistedUserProfiles;
+}
 
 async function readSettingsPersisted() {
   if (isSettingsDbConnected()) {
@@ -1204,6 +1234,7 @@ app.post('/api/profiles', asyncHandler(async (req, res) => {
   };
 
   memoryStore.userProfiles.push(newProfile);
+  writeUserProfilesToDisk(memoryStore.userProfiles);
 
   return sendSuccess(res, { message: 'Profile created', profile: deepClone(newProfile) }, 201);
 }));
@@ -1238,6 +1269,7 @@ app.put('/api/profiles/:id', asyncHandler(async (req, res) => {
     profile.wakeWords = wakeWordsUpdate;
   }
 
+  writeUserProfilesToDisk(memoryStore.userProfiles);
   return sendSuccess(res, { message: 'Profile updated', profile: deepClone(profile) });
 }));
 
@@ -1258,6 +1290,7 @@ app.delete('/api/profiles/:id', asyncHandler(async (req, res) => {
   }
 
   const [removed] = memoryStore.userProfiles.splice(index, 1);
+  writeUserProfilesToDisk(memoryStore.userProfiles);
   return sendSuccess(res, { message: 'Profile deleted', profile: removed });
 }));
 
@@ -1280,6 +1313,7 @@ app.patch('/api/profiles/:id/toggle', asyncHandler(async (req, res) => {
   }
   profile.active = !profile.active;
   profile.updatedAt = nowIso();
+  writeUserProfilesToDisk(memoryStore.userProfiles);
 
   return sendSuccess(res, {
     message: profile.active ? 'Profile activated' : 'Profile deactivated',
@@ -1308,6 +1342,7 @@ app.patch('/api/profiles/:id/usage', asyncHandler(async (req, res) => {
   profile.usageCount = (profile.usageCount || 0) + 1;
   profile.lastUsed = nowIso();
   profile.updatedAt = nowIso();
+  writeUserProfilesToDisk(memoryStore.userProfiles);
 
   return sendSuccess(res, { message: 'Profile usage updated', profile: deepClone(profile) });
 }));
@@ -1343,6 +1378,7 @@ app.post('/api/profiles/:id/favorites/devices', asyncHandler(async (req, res) =>
     profile.favorites.devices.push(deviceId);
   }
   profile.updatedAt = nowIso();
+  writeUserProfilesToDisk(memoryStore.userProfiles);
 
   return sendSuccess(res, {
     message: 'Favorite device added',
@@ -1372,6 +1408,7 @@ app.delete('/api/profiles/:id/favorites/devices/:deviceId', asyncHandler(async (
   if (profile.favorites?.devices) {
     profile.favorites.devices = profile.favorites.devices.filter((item) => String(item) !== String(deviceId));
     profile.updatedAt = nowIso();
+    writeUserProfilesToDisk(memoryStore.userProfiles);
   }
 
   return sendSuccess(res, { message: 'Favorite device removed', profile: deepClone(profile) });

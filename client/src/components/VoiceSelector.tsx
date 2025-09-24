@@ -130,8 +130,17 @@ export function VoiceSelector({
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="pl-9"
+                  autoComplete="off"
+                  onPointerDown={(e) => e.stopPropagation()}
                   onClick={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation?.();
+                  }}
+                  onKeyUp={(e) => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation?.();
+                  }}
                 />
               </div>
             </div>
