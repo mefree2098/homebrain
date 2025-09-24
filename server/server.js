@@ -221,6 +221,20 @@ const DEFAULT_SETTINGS = {
 };
 
 let appSettings = { ...DEFAULT_SETTINGS };
+let settingsLoaded = false;
+let settingsLoadPromise = null;
+
+const isMaskedPlaceholderValue = (value) => {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  if (!value.includes('*')) {
+    return false;
+  }
+  const unmaskedLength = value.replace(/\*/g, '').length;
+  return unmaskedLength <= 4;
+};
+
 const dataDir = path.join(__dirname, 'data');
 const settingsFilePath = path.join(dataDir, 'settings.json');
 
@@ -274,6 +288,29 @@ async function writeSettingsPersisted(updates) {
   return next;
 }
 
+async function ensureSettingsLoaded() {
+  if (settingsLoaded) {
+    return appSettings;
+  }
+
+  if (settingsLoadPromise) {
+    return settingsLoadPromise;
+  }
+
+  settingsLoadPromise = (async () => {
+    const persisted = await readSettingsPersisted();
+    appSettings = { ...DEFAULT_SETTINGS, ...persisted };
+    settingsLoaded = true;
+    return appSettings;
+  })();
+
+  try {
+    return await settingsLoadPromise;
+  } finally {
+    settingsLoadPromise = null;
+  }
+}
+
 const maskSensitiveSettings = (settings) => {
   const masked = { ...settings };
   const sensitiveKeys = [
@@ -313,7 +350,10 @@ const fetchWithFallback = async (...args) => {
 
 const resolveElevenLabsKey = (providedKey) => {
   const key = (providedKey || appSettings.elevenlabsApiKey || process.env.ELEVENLABS_API_KEY || '').trim();
-  return key || null;
+  if (!key || isMaskedPlaceholderValue(key)) {
+    return null;
+  }
+  return key;
 };
 
 const withAbortSignal = (timeoutMs = ELEVENLABS_TIMEOUT_MS) => {
@@ -408,6 +448,7 @@ async function elevenLabsRequest(pathname, { method = 'GET', body, headers = {},
 }
 
 async function fetchElevenLabsVoices({ apiKey, forceRefresh = false } = {}) {
+  await ensureSettingsLoaded();
   const cache = memoryStore.elevenLabs || { voices: [], lastFetched: 0 };
   const now = Date.now();
   const cacheValid = !forceRefresh && cache.voices?.length && (now - cache.lastFetched) < ELEVENLABS_CACHE_TTL_MS;
@@ -724,11 +765,14 @@ const SENSITIVE_KEYS = new Set([
 function stripSensitivePlaceholders(partialSettings, currentSettings) {
   const result = { ...partialSettings };
   for (const key of Object.keys(partialSettings)) {
-    if (SENSITIVE_KEYS.has(key) && typeof partialSettings[key] === 'string' && SENSITIVE_PLACEHOLDER_PATTERN.test(partialSettings[key])) {
-      if (currentSettings && currentSettings[key] !== undefined) {
-        result[key] = currentSettings[key];
-      } else {
-        delete result[key];
+    if (SENSITIVE_KEYS.has(key) && typeof partialSettings[key] === 'string') {
+      const value = partialSettings[key];
+      if (SENSITIVE_PLACEHOLDER_PATTERN.test(value) || isMaskedPlaceholderValue(value)) {
+        if (currentSettings && currentSettings[key] !== undefined) {
+          result[key] = currentSettings[key];
+        } else {
+          delete result[key];
+        }
       }
     }
   }
@@ -736,12 +780,12 @@ function stripSensitivePlaceholders(partialSettings, currentSettings) {
 }
 
 app.get('/api/settings', asyncHandler(async (req, res) => {
-  const persisted = await readSettingsPersisted();
-  appSettings = { ...DEFAULT_SETTINGS, ...persisted };
-  return sendSuccess(res, { settings: maskSensitiveSettings(appSettings) });
+  const settings = await ensureSettingsLoaded();
+  return sendSuccess(res, { settings: maskSensitiveSettings(settings) });
 }));
 
 app.put('/api/settings', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
   const updates = req.body || {};
   const merged = stripSensitivePlaceholders(updates, appSettings);
   const saved = await writeSettingsPersisted(merged);
@@ -750,6 +794,7 @@ app.put('/api/settings', asyncHandler(async (req, res) => {
 }));
 
 app.get('/api/settings/:key', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
   const key = req.params.key;
   if (!(key in appSettings)) {
     return sendError(res, 404, 'Setting not found');
@@ -757,6 +802,7 @@ app.get('/api/settings/:key', asyncHandler(async (req, res) => {
   return sendSuccess(res, { key, value: appSettings[key] });
 }));
 app.post('/api/settings/test-elevenlabs', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
   const { apiKey } = req.body || {};
   const resolvedKey = resolveElevenLabsKey(apiKey);
 
