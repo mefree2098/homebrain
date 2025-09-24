@@ -11,10 +11,25 @@ const morgan = require('morgan');
 const path = require('path');
 const mongoose = require('mongoose');
 const fs = require('fs');
+const fsPromises = fs.promises;
 const { randomUUID } = require('crypto');
 require('dotenv').config();
 
 const SettingsModel = require('./models/Settings');
+let SecurityAlarmModel = null;
+let UserProfileModel = null;
+
+try {
+  SecurityAlarmModel = require('./models/SecurityAlarm');
+} catch (error) {
+  SecurityAlarmModel = null;
+}
+
+try {
+  UserProfileModel = require('./models/UserProfile');
+} catch (error) {
+  UserProfileModel = null;
+}
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const deepClone = (value) => JSON.parse(JSON.stringify(value));
@@ -169,9 +184,17 @@ const createMemoryStore = () => ({
       isOnline: true,
     },
   },
+  userProfiles: [],
+  elevenLabs: { voices: [], lastFetched: 0 },
 });
 
 let memoryStore = createMemoryStore();
+
+const ELEVENLABS_BASE_URL = process.env.ELEVENLABS_BASE_URL || 'https://api.elevenlabs.io';
+const ELEVENLABS_TIMEOUT_MS = Number(process.env.ELEVENLABS_TIMEOUT_MS || 15000);
+const ELEVENLABS_CACHE_TTL_MS = Number(process.env.ELEVENLABS_CACHE_TTL_MS || 5 * 60 * 1000);
+const LOGS_DIR = path.join(__dirname, 'logs');
+const CLIENT_LOG_FILE = path.join(LOGS_DIR, 'client-logs.ndjson');
 
 const DEFAULT_SETTINGS = {
   location: 'New York, NY',
@@ -275,11 +298,271 @@ const buildMockSmartThingsSummary = () => ({
   scenes: deepClone(memoryStore.smartthings?.scenes || []),
 });
 
-const getMockVoices = () => ([
-  { id: 'voice_demo_anna', name: 'Anna', labels: ['Friendly', 'Warm'] },
-  { id: 'voice_demo_henry', name: 'Henry', labels: ['Calm', 'Helpful'] },
-]);
+const fetchWithFallback = async (...args) => {
+  if (typeof global.fetch === 'function') {
+    return global.fetch(...args);
+  }
 
+  try {
+    const { default: fetchFn } = await import('node-fetch');
+    return fetchFn(...args);
+  } catch (error) {
+    throw new Error('Fetch API is not available in this environment. Install node-fetch to enable ElevenLabs integration.');
+  }
+};
+
+const resolveElevenLabsKey = (providedKey) => {
+  const key = (providedKey || appSettings.elevenlabsApiKey || process.env.ELEVENLABS_API_KEY || '').trim();
+  return key || null;
+};
+
+const withAbortSignal = (timeoutMs = ELEVENLABS_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timer);
+    },
+  };
+};
+
+async function elevenLabsRequest(pathname, { method = 'GET', body, headers = {}, apiKey, responseType } = {}) {
+  const key = resolveElevenLabsKey(apiKey);
+  if (!key) {
+    const error = new Error('ElevenLabs API key not configured');
+    error.status = 503;
+    throw error;
+  }
+
+  const url = new URL(pathname, ELEVENLABS_BASE_URL);
+  const init = {
+    method,
+    headers: {
+      'xi-api-key': key,
+      ...headers,
+    },
+  };
+
+  if (body !== undefined) {
+    if (!(body instanceof Buffer) && typeof body !== 'string') {
+      init.headers['Content-Type'] = init.headers['Content-Type'] || 'application/json';
+      init.body = JSON.stringify(body);
+    } else {
+      init.body = body;
+    }
+  }
+
+  const { signal, cleanup } = withAbortSignal();
+  init.signal = signal;
+
+  try {
+    const response = await fetchWithFallback(url, init);
+    cleanup();
+
+    if (!response.ok) {
+      const raw = await response.text().catch(() => '');
+      let details;
+      try {
+        details = raw ? JSON.parse(raw) : undefined;
+      } catch {
+        details = raw ? { message: raw } : undefined;
+      }
+      const error = new Error(details?.message || details?.error || response.statusText);
+      error.status = response.status;
+      error.details = details;
+      throw error;
+    }
+
+    if (responseType === 'buffer') {
+      const buffer = await response.arrayBuffer();
+      return Buffer.from(buffer);
+    }
+
+    if (responseType === 'stream') {
+      return response.body;
+    }
+
+    if (response.status === 204) {
+      return null;
+    }
+
+    const text = await response.text();
+    if (!text) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      const timeoutError = new Error('ElevenLabs request timed out');
+      timeoutError.status = 504;
+      throw timeoutError;
+    }
+    throw error;
+  }
+}
+
+async function fetchElevenLabsVoices({ apiKey, forceRefresh = false } = {}) {
+  const cache = memoryStore.elevenLabs || { voices: [], lastFetched: 0 };
+  const now = Date.now();
+  const cacheValid = !forceRefresh && cache.voices?.length && (now - cache.lastFetched) < ELEVENLABS_CACHE_TTL_MS;
+
+  if (cacheValid) {
+    return cache.voices;
+  }
+
+  const result = await elevenLabsRequest('/v1/voices', { apiKey });
+  const voices = Array.isArray(result?.voices) ? result.voices : Array.isArray(result) ? result : [];
+
+  memoryStore.elevenLabs = {
+    voices,
+    lastFetched: now,
+  };
+
+  return voices;
+}
+
+function sanitizeVoiceSummary(voice) {
+  if (!voice) return null;
+
+  return {
+    id: voice.voice_id || voice.id,
+    name: voice.name,
+    category: voice.category || voice.voice_category || null,
+    labels: voice.labels || voice.tags || {},
+    description: voice.description || '',
+    preview_url: voice.preview_url || voice.previewUrl || null,
+    language: voice.language || voice?.preview?.language || null,
+    settings: voice.settings || voice.voice_settings || undefined,
+  };
+}
+
+function mapVoicesResponse(voices) {
+  return voices.map((voice) => sanitizeVoiceSummary(voice)).filter(Boolean);
+}
+
+const buildVoiceSettingsPayload = (options = {}) => {
+  const voiceSettings = {
+    stability: options.stability,
+    similarity_boost: options.similarity_boost,
+    style: options.style,
+    use_speaker_boost: options.use_speaker_boost,
+  };
+
+  Object.keys(voiceSettings).forEach((key) => {
+    if (voiceSettings[key] === undefined || voiceSettings[key] === null) {
+      delete voiceSettings[key];
+    }
+  });
+
+  return Object.keys(voiceSettings).length ? { voice_settings: voiceSettings } : {};
+};
+
+async function elevenLabsTextToSpeech(voiceId, text, options = {}) {
+  const payload = {
+    text,
+    ...(options.model_id ? { model_id: options.model_id } : {}),
+    ...buildVoiceSettingsPayload(options),
+  };
+
+  return elevenLabsRequest(`/v1/text-to-speech/${voiceId}`, {
+    method: 'POST',
+    body: payload,
+    headers: {
+      Accept: 'audio/mpeg',
+    },
+    responseType: 'buffer',
+  });
+}
+
+async function appendClientLogs(entries) {
+  if (!entries || entries.length === 0) {
+    return;
+  }
+
+  const sanitized = entries
+    .filter((entry) => entry && typeof entry === 'object')
+    .slice(-MAX_LOG_PAYLOAD);
+
+  if (!sanitized.length) {
+    return;
+  }
+
+  try {
+    ensureLogsDir();
+    const payload = sanitized.map((entry) => JSON.stringify(entry)).join('\n') + '\n';
+    await fsPromises.appendFile(CLIENT_LOG_FILE, payload, 'utf-8');
+  } catch (error) {
+    console.warn('Failed to persist client logs:', error.message);
+  }
+}
+
+function buildClientLogEntries(logs, context = {}) {
+  if (!Array.isArray(logs)) {
+    return [];
+  }
+
+  return logs
+    .filter((log) => log && typeof log === 'object')
+    .map((log) => ({
+      level: log.method || log.level || 'log',
+      message: typeof log.message === 'string' ? log.message : JSON.stringify(log.message ?? ''),
+      timestamp: log.timestamp || new Date().toISOString(),
+      source: 'client',
+      ...context,
+    }));
+}
+const nowIso = () => new Date().toISOString();
+
+const recalculateSecurityStatus = () => {
+  const security = memoryStore.security;
+  if (!security || !security.status) {
+    return;
+  }
+
+  const zones = security.alarm?.zones || [];
+  security.status.zoneCount = zones.length;
+  security.status.activeZones = zones.filter((zone) => zone && zone.enabled !== false && !zone.bypassed).length;
+  security.status.bypassedZones = zones.filter((zone) => zone?.bypassed).length;
+};
+
+const applyAlarmState = (state, { actor, event } = {}) => {
+  const security = memoryStore.security;
+  if (!security || !security.status || !security.alarm) {
+    return;
+  }
+
+  const timestamp = nowIso();
+  security.status.alarmState = state;
+  security.alarm.alarmState = state;
+  security.status.isTriggered = state === 'triggered';
+  security.status.isArmed = state === 'armedStay' || state === 'armedAway';
+
+  if (security.status.isArmed) {
+    security.status.lastArmed = timestamp;
+    security.alarm.lastArmed = timestamp;
+    security.status.armedBy = actor || 'system';
+    security.alarm.armedBy = actor || 'system';
+  } else if (event === 'disarm' || !security.status.isArmed) {
+    security.status.lastDisarmed = timestamp;
+    security.alarm.lastDisarmed = timestamp;
+    security.alarm.disarmedBy = actor || 'system';
+    security.status.armedBy = null;
+    security.alarm.zones = (security.alarm.zones || []).map((zone) => ({ ...zone, bypassed: false }));
+  }
+
+  if (state === 'triggered') {
+    security.status.lastTriggered = timestamp;
+    security.alarm.lastTriggered = timestamp;
+  }
+
+  recalculateSecurityStatus();
+};
 const testMockProvider = (provider) => ({
   provider,
   ok: true,
@@ -373,6 +656,23 @@ app.post('/api/auth/refresh', asyncHandler(async (req, res) => {
 app.post('/api/auth/logout', asyncHandler(async (_req, res) => {
   return sendSuccess(res, { message: 'Logged out' });
 }));
+
+app.post('/logs', asyncHandler(async (req, res) => {
+  const { logs = [], domMetrics = {}, url } = req.body || {};
+  const userAgent = req.headers['user-agent'];
+  const entries = buildClientLogEntries(logs, {
+    domMetrics,
+    url: url || req.headers.referer || null,
+    userAgent,
+    receivedAt: new Date().toISOString(),
+  });
+
+  if (entries.length) {
+    await appendClientLogs(entries);
+  }
+
+  return res.status(204).end();
+}));
 const SENSITIVE_PLACEHOLDER_PATTERN = /^\u0007+/;
 const SENSITIVE_KEYS = new Set([
   'elevenlabsApiKey',
@@ -419,17 +719,27 @@ app.get('/api/settings/:key', asyncHandler(async (req, res) => {
 }));
 app.post('/api/settings/test-elevenlabs', asyncHandler(async (req, res) => {
   const { apiKey } = req.body || {};
-  if (!apiKey && !appSettings.elevenlabsApiKey) {
+  const resolvedKey = resolveElevenLabsKey(apiKey);
+
+  if (!resolvedKey) {
     return sendError(res, 400, 'apiKey required');
   }
 
-  if (apiKey) {
-    appSettings.elevenlabsApiKey = apiKey;
-    await writeSettingsPersisted({ elevenlabsApiKey: apiKey });
-  }
+  try {
+    const voices = await fetchElevenLabsVoices({ apiKey: resolvedKey, forceRefresh: true });
+    appSettings.elevenlabsApiKey = resolvedKey;
+    await writeSettingsPersisted({ elevenlabsApiKey: resolvedKey });
 
-  const voices = getMockVoices();
-  return sendSuccess(res, { success: true, message: 'ElevenLabs key accepted (mock)', voiceCount: voices.length, voices });
+    return sendSuccess(res, {
+      message: 'ElevenLabs key validated',
+      voiceCount: voices.length,
+      voices: mapVoicesResponse(voices),
+    });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to validate ElevenLabs key';
+    return sendError(res, status, message, error.details);
+  }
 }));
 
 app.post('/api/settings/test-openai', asyncHandler(async (req, res) => {
@@ -489,7 +799,590 @@ app.post('/api/settings/test-smartthings', asyncHandler(async (_req, res) => {
   const summary = buildMockSmartThingsSummary();
   return sendSuccess(res, { success: true, message: 'SmartThings integration mocked', deviceCount: summary.devices.length, summary });
 }));
-app.get('/api/devices', asyncHandler(async (req, res) => {
+app.get('/api/security-alarm', asyncHandler(async (_req, res) => {
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    return sendSuccess(res, { alarm: alarm.toObject() });
+  }
+
+  return sendSuccess(res, { alarm: deepClone(memoryStore.security.alarm) });
+}));
+
+app.get('/api/security-alarm/status', asyncHandler(async (_req, res) => {
+  recalculateSecurityStatus();
+  return sendSuccess(res, { status: deepClone(memoryStore.security.status) });
+}));
+
+app.post('/api/security-alarm/arm', asyncHandler(async (req, res) => {
+  const { mode } = req.body || {};
+  if (!['stay', 'away'].includes(mode)) {
+    return sendError(res, 400, 'mode must be "stay" or "away"');
+  }
+
+  const actor = req.user?.name || req.user?.email || 'system';
+
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    await alarm.arm(mode, actor);
+    return sendSuccess(res, { message: `Security system armed (${mode})`, alarm: alarm.toObject() });
+  }
+
+  const state = mode === 'stay' ? 'armedStay' : 'armedAway';
+  applyAlarmState(state, { actor, event: 'arm' });
+  recalculateSecurityStatus();
+
+  return sendSuccess(res, {
+    message: `Security system armed (${mode})`,
+    alarm: deepClone(memoryStore.security.alarm),
+    status: deepClone(memoryStore.security.status),
+  });
+}));
+
+app.post('/api/security-alarm/disarm', asyncHandler(async (req, res) => {
+  const actor = req.user?.name || req.user?.email || 'system';
+
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    await alarm.disarm(actor);
+    return sendSuccess(res, { message: 'Security system disarmed', alarm: alarm.toObject() });
+  }
+
+  applyAlarmState('disarmed', { actor, event: 'disarm' });
+  recalculateSecurityStatus();
+
+  return sendSuccess(res, {
+    message: 'Security system disarmed',
+    alarm: deepClone(memoryStore.security.alarm),
+    status: deepClone(memoryStore.security.status),
+  });
+}));
+
+app.post('/api/security-alarm/zones', asyncHandler(async (req, res) => {
+  const { name, deviceId, deviceType, enabled = true, bypassable = true } = req.body || {};
+  if (!name || !deviceId || !deviceType) {
+    return sendError(res, 400, 'name, deviceId, and deviceType are required');
+  }
+
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    const zone = await alarm.addZone({ name, deviceId, deviceType, enabled, bypassable });
+    return sendSuccess(res, { message: 'Zone added', alarm: alarm.toObject(), zone });
+  }
+
+  const zone = {
+    zoneId: generateId('zone'),
+    name,
+    deviceId,
+    deviceType,
+    status: 'clear',
+    enabled: Boolean(enabled),
+    bypassable: Boolean(bypassable),
+    bypassed: false,
+    lastTriggered: null,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+
+  memoryStore.security.alarm.zones.push(zone);
+  recalculateSecurityStatus();
+
+  return sendSuccess(res, {
+    message: 'Zone added',
+    alarm: deepClone(memoryStore.security.alarm),
+    zone,
+  }, 201);
+}));
+
+app.delete('/api/security-alarm/zones/:deviceId', asyncHandler(async (req, res) => {
+  const { deviceId } = req.params;
+
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    await alarm.removeZone(deviceId);
+    return sendSuccess(res, { message: 'Zone removed', alarm: alarm.toObject() });
+  }
+
+  const zones = memoryStore.security.alarm.zones;
+  const index = zones.findIndex((zone) => zone.deviceId === deviceId);
+  if (index === -1) {
+    return sendError(res, 404, 'Zone not found');
+  }
+
+  zones.splice(index, 1);
+  recalculateSecurityStatus();
+
+  return sendSuccess(res, {
+    message: 'Zone removed',
+    alarm: deepClone(memoryStore.security.alarm),
+  });
+}));
+
+app.put('/api/security-alarm/zones/:deviceId/bypass', asyncHandler(async (req, res) => {
+  const { deviceId } = req.params;
+  const { bypass } = req.body || {};
+
+  if (typeof bypass !== 'boolean') {
+    return sendError(res, 400, 'bypass must be a boolean');
+  }
+
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    await alarm.bypassZone(deviceId, bypass);
+    return sendSuccess(res, { message: bypass ? 'Zone bypassed' : 'Zone unbypassed', alarm: alarm.toObject() });
+  }
+
+  const zone = memoryStore.security.alarm.zones.find((item) => item.deviceId === deviceId);
+  if (!zone) {
+    return sendError(res, 404, 'Zone not found');
+  }
+  if (!zone.bypassable) {
+    return sendError(res, 400, 'Zone is not bypassable');
+  }
+
+  zone.bypassed = bypass;
+  zone.updatedAt = nowIso();
+  recalculateSecurityStatus();
+
+  return sendSuccess(res, {
+    message: bypass ? 'Zone bypassed' : 'Zone unbypassed',
+    alarm: deepClone(memoryStore.security.alarm),
+  });
+}));
+
+app.post('/api/security-alarm/sync', asyncHandler(async (_req, res) => {
+  if (!appSettings.smartthingsToken) {
+    return sendError(res, 400, 'SmartThings token not configured');
+  }
+
+  if (memoryStore.security.alarm) {
+    memoryStore.security.alarm.lastSyncWithSmartThings = nowIso();
+  }
+  return sendSuccess(res, {
+    message: 'Security alarm synchronized',
+    alarm: deepClone(memoryStore.security.alarm),
+  });
+}));
+
+app.put('/api/security-alarm/configure', asyncHandler(async (req, res) => {
+  const { smartthingsDeviceId } = req.body || {};
+  if (!smartthingsDeviceId) {
+    return sendError(res, 400, 'smartthingsDeviceId is required');
+  }
+
+  if (isDbConnected() && SecurityAlarmModel) {
+    const alarm = await SecurityAlarmModel.getMainAlarm();
+    alarm.smartthingsDeviceId = smartthingsDeviceId;
+    await alarm.save();
+    return sendSuccess(res, { message: 'Security alarm configured', alarm: alarm.toObject() });
+  }
+
+  memoryStore.security.alarm.smartthingsDeviceId = smartthingsDeviceId;
+  return sendSuccess(res, {
+    message: 'Security alarm configured',
+    alarm: deepClone(memoryStore.security.alarm),
+  });
+}));
+
+app.get('/api/profiles', asyncHandler(async (_req, res) => {
+  if (isDbConnected() && UserProfileModel) {
+    const docs = await UserProfileModel.find().lean();
+    return sendSuccess(res, { profiles: docs, count: docs.length });
+  }
+
+  return sendSuccess(res, { profiles: deepClone(memoryStore.userProfiles), count: memoryStore.userProfiles.length });
+}));
+
+app.get('/api/profiles/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findById(id).lean();
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    return sendSuccess(res, { profile: doc });
+  }
+
+  const profile = memoryStore.userProfiles.find((item) => item._id === id);
+  if (!profile) {
+    return sendError(res, 404, 'Profile not found');
+  }
+  return sendSuccess(res, { profile: deepClone(profile) });
+}));
+
+app.post('/api/profiles', asyncHandler(async (req, res) => {
+  const payload = req.body || {};
+  const name = (payload.name || '').trim();
+  const systemPrompt = (payload.systemPrompt || '').trim();
+  const voiceId = (payload.voiceId || '').trim();
+  const wakeWordsInput = payload.wakeWords;
+  const wakeWords = Array.isArray(wakeWordsInput)
+    ? wakeWordsInput.map((word) => String(word).trim()).filter(Boolean)
+    : String(wakeWordsInput || '')
+        .split(',')
+        .map((word) => word.trim())
+        .filter(Boolean);
+
+  if (!name || !systemPrompt || !voiceId || wakeWords.length === 0) {
+    return sendError(res, 400, 'name, systemPrompt, voiceId, and wakeWords are required');
+  }
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.create({ ...payload, name, systemPrompt, voiceId, wakeWords });
+    return sendSuccess(res, { message: 'Profile created', profile: doc.toObject() }, 201);
+  }
+
+  const timestamp = nowIso();
+  const newProfile = {
+    _id: generateId('profile'),
+    name,
+    wakeWords,
+    voiceId,
+    voiceName: payload.voiceName || '',
+    systemPrompt,
+    personality: payload.personality || 'friendly',
+    responseStyle: payload.responseStyle || 'conversational',
+    preferredLanguage: payload.preferredLanguage || 'en-US',
+    timezone: payload.timezone || 'UTC',
+    speechRate: Number(payload.speechRate ?? 1),
+    speechPitch: Number(payload.speechPitch ?? 1),
+    active: payload.active !== undefined ? Boolean(payload.active) : true,
+    permissions: Array.isArray(payload.permissions) ? payload.permissions : [],
+    lastUsed: null,
+    usageCount: 0,
+    avatar: payload.avatar || null,
+    birthDate: payload.birthDate || null,
+    favorites: {
+      devices: [],
+      scenes: [],
+      automations: [],
+    },
+    contextMemory: payload.contextMemory !== undefined ? Boolean(payload.contextMemory) : true,
+    learningMode: payload.learningMode !== undefined ? Boolean(payload.learningMode) : true,
+    privacyMode: payload.privacyMode !== undefined ? Boolean(payload.privacyMode) : false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+
+  memoryStore.userProfiles.push(newProfile);
+
+  return sendSuccess(res, { message: 'Profile created', profile: deepClone(newProfile) }, 201);
+}));
+
+app.put('/api/profiles/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body || {};
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findByIdAndUpdate(id, updates, { new: true });
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    return sendSuccess(res, { message: 'Profile updated', profile: doc.toObject() });
+  }
+
+  const profile = memoryStore.userProfiles.find((item) => item._id === id);
+  if (!profile) {
+    return sendError(res, 404, 'Profile not found');
+  }
+
+  Object.assign(profile, updates);
+  profile.updatedAt = nowIso();
+
+  if (updates.wakeWords) {
+    const wakeWordsUpdate = Array.isArray(updates.wakeWords)
+      ? updates.wakeWords
+      : String(updates.wakeWords || '')
+          .split(',')
+          .map((word) => word.trim())
+          .filter(Boolean);
+    profile.wakeWords = wakeWordsUpdate;
+  }
+
+  return sendSuccess(res, { message: 'Profile updated', profile: deepClone(profile) });
+}));
+
+app.delete('/api/profiles/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findByIdAndDelete(id);
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    return sendSuccess(res, { message: 'Profile deleted', profile: doc.toObject() });
+  }
+
+  const index = memoryStore.userProfiles.findIndex((item) => item._id === id);
+  if (index === -1) {
+    return sendError(res, 404, 'Profile not found');
+  }
+
+  const [removed] = memoryStore.userProfiles.splice(index, 1);
+  return sendSuccess(res, { message: 'Profile deleted', profile: removed });
+}));
+
+app.patch('/api/profiles/:id/toggle', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findById(id);
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    doc.active = !doc.active;
+    await doc.save();
+    return sendSuccess(res, { message: doc.active ? 'Profile activated' : 'Profile deactivated', profile: doc.toObject() });
+  }
+
+  const profile = memoryStore.userProfiles.find((item) => item._id === id);
+  if (!profile) {
+    return sendError(res, 404, 'Profile not found');
+  }
+  profile.active = !profile.active;
+  profile.updatedAt = nowIso();
+
+  return sendSuccess(res, {
+    message: profile.active ? 'Profile activated' : 'Profile deactivated',
+    profile: deepClone(profile),
+  });
+}));
+
+app.patch('/api/profiles/:id/usage', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findById(id);
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    doc.usageCount = (doc.usageCount || 0) + 1;
+    doc.lastUsed = new Date();
+    await doc.save();
+    return sendSuccess(res, { message: 'Profile usage updated', profile: doc.toObject() });
+  }
+
+  const profile = memoryStore.userProfiles.find((item) => item._id === id);
+  if (!profile) {
+    return sendError(res, 404, 'Profile not found');
+  }
+  profile.usageCount = (profile.usageCount || 0) + 1;
+  profile.lastUsed = nowIso();
+  profile.updatedAt = nowIso();
+
+  return sendSuccess(res, { message: 'Profile usage updated', profile: deepClone(profile) });
+}));
+
+app.post('/api/profiles/:id/favorites/devices', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { deviceId } = req.body || {};
+  if (!deviceId) {
+    return sendError(res, 400, 'deviceId is required');
+  }
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findById(id);
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    if (!doc.favorites) doc.favorites = { devices: [], scenes: [], automations: [] };
+    if (!doc.favorites.devices.includes(deviceId)) {
+      doc.favorites.devices.push(deviceId);
+      await doc.save();
+    }
+    return sendSuccess(res, { message: 'Favorite device added', profile: doc.toObject() });
+  }
+
+  const profile = memoryStore.userProfiles.find((item) => item._id === id);
+  if (!profile) {
+    return sendError(res, 404, 'Profile not found');
+  }
+  if (!profile.favorites) {
+    profile.favorites = { devices: [], scenes: [], automations: [] };
+  }
+  if (!profile.favorites.devices.includes(deviceId)) {
+    profile.favorites.devices.push(deviceId);
+  }
+  profile.updatedAt = nowIso();
+
+  return sendSuccess(res, {
+    message: 'Favorite device added',
+    profile: deepClone(profile),
+  });
+}));
+
+app.delete('/api/profiles/:id/favorites/devices/:deviceId', asyncHandler(async (req, res) => {
+  const { id, deviceId } = req.params;
+
+  if (isDbConnected() && UserProfileModel) {
+    const doc = await UserProfileModel.findById(id);
+    if (!doc) {
+      return sendError(res, 404, 'Profile not found');
+    }
+    if (doc.favorites?.devices) {
+      doc.favorites.devices = doc.favorites.devices.filter((item) => String(item) !== String(deviceId));
+      await doc.save();
+    }
+    return sendSuccess(res, { message: 'Favorite device removed', profile: doc.toObject() });
+  }
+
+  const profile = memoryStore.userProfiles.find((item) => item._id === id);
+  if (!profile) {
+    return sendError(res, 404, 'Profile not found');
+  }
+  if (profile.favorites?.devices) {
+    profile.favorites.devices = profile.favorites.devices.filter((item) => String(item) !== String(deviceId));
+    profile.updatedAt = nowIso();
+  }
+
+  return sendSuccess(res, { message: 'Favorite device removed', profile: deepClone(profile) });
+}));
+
+app.get('/api/profiles/voices', asyncHandler(async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true';
+    const voices = await fetchElevenLabsVoices({ forceRefresh });
+    return sendSuccess(res, { voices: mapVoicesResponse(voices), count: voices.length });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to load ElevenLabs voices';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.get('/api/profiles/voices/:voiceId', asyncHandler(async (req, res) => {
+  const { voiceId } = req.params;
+  try {
+    const voice = await elevenLabsRequest(`/v1/voices/${voiceId}`);
+    return sendSuccess(res, { voice });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to load voice details';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.post('/api/profiles/voices/:voiceId/validate', asyncHandler(async (req, res) => {
+  const { voiceId } = req.params;
+  try {
+    await elevenLabsRequest(`/v1/voices/${voiceId}`);
+    return sendSuccess(res, { valid: true, voiceId });
+  } catch (error) {
+    if (error.status === 404) {
+      return sendSuccess(res, { valid: false, voiceId });
+    }
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to validate voice';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.get('/api/profiles/wake-word/:wakeWord', asyncHandler(async (req, res) => {
+  const wakeWord = String(req.params.wakeWord || '').toLowerCase();
+
+  if (isDbConnected() && UserProfileModel) {
+    const regex = new RegExp(`^${wakeWord}$`, 'i');
+    const docs = await UserProfileModel.find({ wakeWords: regex }).lean();
+    return sendSuccess(res, { profiles: docs, count: docs.length });
+  }
+
+  const profiles = memoryStore.userProfiles.filter((profile) =>
+    (profile.wakeWords || []).some((word) => word.toLowerCase() === wakeWord)
+  );
+  return sendSuccess(res, { profiles: deepClone(profiles), count: profiles.length });
+}));
+
+app.get('/api/elevenlabs/voices', asyncHandler(async (req, res) => {
+  try {
+    const voices = await fetchElevenLabsVoices({ forceRefresh: req.query.refresh === 'true' });
+    return sendSuccess(res, { voices: mapVoicesResponse(voices), count: voices.length });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to load ElevenLabs voices';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.get('/api/elevenlabs/voices/:voiceId', asyncHandler(async (req, res) => {
+  const { voiceId } = req.params;
+  try {
+    const voice = await elevenLabsRequest(`/v1/voices/${voiceId}`);
+    return sendSuccess(res, { voice });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to load voice';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.get('/api/elevenlabs/status', asyncHandler(async (_req, res) => {
+  try {
+    const voices = await fetchElevenLabsVoices();
+    return sendSuccess(res, {
+      status: {
+        configured: Boolean(resolveElevenLabsKey()),
+        apiKeyValid: true,
+        totalVoices: voices.length,
+        service: 'ElevenLabs',
+        baseUrl: ELEVENLABS_BASE_URL,
+      },
+    });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to fetch ElevenLabs status';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.post('/api/elevenlabs/text-to-speech', asyncHandler(async (req, res) => {
+  const { voiceId, text, options = {} } = req.body || {};
+  if (!voiceId || !text) {
+    return sendError(res, 400, 'voiceId and text are required');
+  }
+
+  try {
+    const buffer = await elevenLabsTextToSpeech(voiceId, text, options);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    return res.status(200).send(buffer);
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to generate speech';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.post('/api/elevenlabs/preview', asyncHandler(async (req, res) => {
+  const { voiceId, text } = req.body || {};
+  if (!voiceId) {
+    return sendError(res, 400, 'voiceId is required');
+  }
+  const previewText = text || 'Hello from HomeBrain. Your smart home is ready.';
+
+  try {
+    const buffer = await elevenLabsTextToSpeech(voiceId, previewText, {});
+    res.setHeader('Content-Type', 'audio/mpeg');
+    return res.status(200).send(buffer);
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to generate preview';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.post('/api/elevenlabs/voices/:voiceId/validate', asyncHandler(async (req, res) => {
+  const { voiceId } = req.params;
+  try {
+    await elevenLabsRequest(`/v1/voices/${voiceId}`);
+    return sendSuccess(res, { valid: true, voiceId });
+  } catch (error) {
+    if (error.status === 404) {
+      return sendSuccess(res, { valid: false, voiceId });
+    }
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to validate voice';
+    return sendError(res, status, message, error.details);
+  }
+}));app.get('/api/devices', asyncHandler(async (req, res) => {
   const { room, type, status, isOnline } = req.query || {};
 
   if (isDbConnected()) {
@@ -1145,3 +2038,10 @@ async function gracefulShutdown(signal) {
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+
+
+
+
+
+
