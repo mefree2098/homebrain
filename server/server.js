@@ -1,6 +1,12 @@
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
+let helmet;
+try {
+  helmet = require('helmet');
+} catch (error) {
+  console.warn('helmet not installed; continuing without security headers. Run `npm install` in server/ to restore.', error.message);
+  helmet = () => (req, res, next) => next();
+}
 const morgan = require('morgan');
 const path = require('path');
 const mongoose = require('mongoose');
