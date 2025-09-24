@@ -509,13 +509,41 @@ function buildClientLogEntries(logs, context = {}) {
 
   return logs
     .filter((log) => log && typeof log === 'object')
-    .map((log) => ({
-      level: log.method || log.level || 'log',
-      message: typeof log.message === 'string' ? log.message : JSON.stringify(log.message ?? ''),
-      timestamp: log.timestamp || new Date().toISOString(),
-      source: 'client',
-      ...context,
-    }));
+    .map((log) => {
+      let resolvedMessage;
+      const payload = log.message ?? log;
+
+      if (typeof payload === 'string') {
+        resolvedMessage = payload;
+      } else if (payload && typeof payload === 'object' && 'message' in payload && typeof payload.message === 'string') {
+        resolvedMessage = payload.message;
+      } else {
+        try {
+          resolvedMessage = JSON.stringify(payload ?? '');
+        } catch (error) {
+          resolvedMessage = String(payload ?? '[unserializable]');
+        }
+      }
+
+      let timestamp = log.timestamp;
+      if (!timestamp) {
+        timestamp = new Date().toISOString();
+      } else {
+        try {
+          timestamp = new Date(timestamp).toISOString();
+        } catch {
+          timestamp = new Date().toISOString();
+        }
+      }
+
+      return {
+        level: log.method || log.level || 'log',
+        message: resolvedMessage,
+        timestamp,
+        source: 'client',
+        ...context,
+      };
+    });
 }
 const nowIso = () => new Date().toISOString();
 
@@ -660,15 +688,26 @@ app.post('/api/auth/logout', asyncHandler(async (_req, res) => {
 app.post('/logs', asyncHandler(async (req, res) => {
   const { logs = [], domMetrics = {}, url } = req.body || {};
   const userAgent = req.headers['user-agent'];
-  const entries = buildClientLogEntries(logs, {
-    domMetrics,
-    url: url || req.headers.referer || null,
-    userAgent,
-    receivedAt: new Date().toISOString(),
-  });
+  let entries = [];
+
+  try {
+    entries = buildClientLogEntries(logs, {
+      domMetrics,
+      url: url || req.headers.referer || null,
+      userAgent,
+      receivedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn('Failed to normalize client logs:', error.message);
+    entries = [];
+  }
 
   if (entries.length) {
-    await appendClientLogs(entries);
+    try {
+      await appendClientLogs(entries);
+    } catch (error) {
+      console.warn('Failed to persist client logs:', error.message);
+    }
   }
 
   return res.status(204).end();
@@ -992,6 +1031,60 @@ app.get('/api/profiles', asyncHandler(async (_req, res) => {
   return sendSuccess(res, { profiles: deepClone(memoryStore.userProfiles), count: memoryStore.userProfiles.length });
 }));
 
+app.get('/api/profiles/voices', asyncHandler(async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true';
+    const voices = await fetchElevenLabsVoices({ forceRefresh });
+    return sendSuccess(res, { voices: mapVoicesResponse(voices), count: voices.length });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to load ElevenLabs voices';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.get('/api/profiles/voices/:voiceId', asyncHandler(async (req, res) => {
+  const { voiceId } = req.params;
+  try {
+    const voice = await elevenLabsRequest(`/v1/voices/${voiceId}`);
+    return sendSuccess(res, { voice });
+  } catch (error) {
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to load voice details';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.post('/api/profiles/voices/:voiceId/validate', asyncHandler(async (req, res) => {
+  const { voiceId } = req.params;
+  try {
+    await elevenLabsRequest(`/v1/voices/${voiceId}`);
+    return sendSuccess(res, { valid: true, voiceId });
+  } catch (error) {
+    if (error.status === 404) {
+      return sendSuccess(res, { valid: false, voiceId });
+    }
+    const status = error.status ?? 500;
+    const message = error.message || 'Failed to validate voice';
+    return sendError(res, status, message, error.details);
+  }
+}));
+
+app.get('/api/profiles/wake-word/:wakeWord', asyncHandler(async (req, res) => {
+  const wakeWord = String(req.params.wakeWord || '').toLowerCase();
+
+  if (isDbConnected() && UserProfileModel) {
+    const regex = new RegExp(`^${wakeWord}$`, 'i');
+    const docs = await UserProfileModel.find({ wakeWords: regex }).lean();
+    return sendSuccess(res, { profiles: docs, count: docs.length });
+  }
+
+  const profiles = memoryStore.userProfiles.filter((profile) =>
+    (profile.wakeWords || []).some((word) => word.toLowerCase() === wakeWord)
+  );
+  return sendSuccess(res, { profiles: deepClone(profiles), count: profiles.length });
+}));
+
 app.get('/api/profiles/:id', asyncHandler(async (req, res) => {
   const { id } = req.params;
 
@@ -1236,60 +1329,6 @@ app.delete('/api/profiles/:id/favorites/devices/:deviceId', asyncHandler(async (
   }
 
   return sendSuccess(res, { message: 'Favorite device removed', profile: deepClone(profile) });
-}));
-
-app.get('/api/profiles/voices', asyncHandler(async (req, res) => {
-  try {
-    const forceRefresh = req.query.refresh === 'true';
-    const voices = await fetchElevenLabsVoices({ forceRefresh });
-    return sendSuccess(res, { voices: mapVoicesResponse(voices), count: voices.length });
-  } catch (error) {
-    const status = error.status ?? 500;
-    const message = error.message || 'Failed to load ElevenLabs voices';
-    return sendError(res, status, message, error.details);
-  }
-}));
-
-app.get('/api/profiles/voices/:voiceId', asyncHandler(async (req, res) => {
-  const { voiceId } = req.params;
-  try {
-    const voice = await elevenLabsRequest(`/v1/voices/${voiceId}`);
-    return sendSuccess(res, { voice });
-  } catch (error) {
-    const status = error.status ?? 500;
-    const message = error.message || 'Failed to load voice details';
-    return sendError(res, status, message, error.details);
-  }
-}));
-
-app.post('/api/profiles/voices/:voiceId/validate', asyncHandler(async (req, res) => {
-  const { voiceId } = req.params;
-  try {
-    await elevenLabsRequest(`/v1/voices/${voiceId}`);
-    return sendSuccess(res, { valid: true, voiceId });
-  } catch (error) {
-    if (error.status === 404) {
-      return sendSuccess(res, { valid: false, voiceId });
-    }
-    const status = error.status ?? 500;
-    const message = error.message || 'Failed to validate voice';
-    return sendError(res, status, message, error.details);
-  }
-}));
-
-app.get('/api/profiles/wake-word/:wakeWord', asyncHandler(async (req, res) => {
-  const wakeWord = String(req.params.wakeWord || '').toLowerCase();
-
-  if (isDbConnected() && UserProfileModel) {
-    const regex = new RegExp(`^${wakeWord}$`, 'i');
-    const docs = await UserProfileModel.find({ wakeWords: regex }).lean();
-    return sendSuccess(res, { profiles: docs, count: docs.length });
-  }
-
-  const profiles = memoryStore.userProfiles.filter((profile) =>
-    (profile.wakeWords || []).some((word) => word.toLowerCase() === wakeWord)
-  );
-  return sendSuccess(res, { profiles: deepClone(profiles), count: profiles.length });
 }));
 
 app.get('/api/elevenlabs/voices', asyncHandler(async (req, res) => {
