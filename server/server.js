@@ -1,50 +1,24 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const morgan = require('morgan');
-const axios = require('axios');
 const path = require('path');
-const http = require('http');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const { randomUUID } = require('crypto');
 require('dotenv').config();
-const { Types: { ObjectId } } = mongoose;
-
-const { connectDB, closeDB } = require('./config/database');
-const { authMiddleware, isPublicRoute } = require('./middleware/auth');
-const { hashPassword, comparePassword, validatePassword } = require('./utils/password');
-const {
-  issueAccessToken,
-  issueRefreshToken,
-  verifyRefreshToken,
-  generateRefreshTokenValue,
-} = require('./utils/tokens');
-const { ROLES } = require('../shared/config/roles');
 
 const SettingsModel = require('./models/Settings');
-const DeviceModel = require('./models/Device');
-const SceneModel = require('./models/Scene');
-const AutomationModel = require('./models/Automation');
-const VoiceDeviceModel = require('./models/VoiceDevice');
-const VoiceCommandModel = require('./models/VoiceCommand');
-const SecurityAlarmModel = require('./models/SecurityAlarm');
-const SmartThingsIntegrationModel = require('./models/SmartThingsIntegration');
-const UserProfileModel = require('./models/UserProfile');
-const UserModel = require('./models/User');
-const RemoteDeviceModel = require('./models/RemoteDevice');
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 const deepClone = (value) => JSON.parse(JSON.stringify(value));
 
 const generateId = (prefix = 'hb') => `${prefix}-${randomUUID()}`;
 
-const isDbConnected = () => mongoose.connection && mongoose.connection.readyState === 1;
+const isSettingsDbConnected = () => mongoose.connection && mongoose.connection.readyState === 1;
+const isDbConnected = () => false;
 
 const ACCESS_CONTROL_ALLOWLIST = (process.env.CORS_ORIGIN || '').split(',').map((v) => v.trim()).filter(Boolean);
-
-const DEMO_AUDIO_BUFFER = Buffer.from('ID3mock-homebrain-audio');
 
 const createMemoryStore = () => ({
   devices: [
@@ -228,7 +202,7 @@ const ensureDataDir = () => {
 };
 
 async function readSettingsPersisted() {
-  if (isDbConnected()) {
+  if (isSettingsDbConnected()) {
     try {
       const doc = await SettingsModel.getSettings();
       return doc.toObject();
@@ -252,7 +226,7 @@ async function writeSettingsPersisted(updates) {
   const current = await readSettingsPersisted();
   const next = { ...current, ...updates };
 
-  if (isDbConnected()) {
+  if (isSettingsDbConnected()) {
     try {
       const saved = await SettingsModel.updateSettings(next);
       return saved.toObject();
@@ -289,171 +263,24 @@ const maskSensitiveSettings = (settings) => {
 
   return masked;
 };
-const prepareSeedData = () => {
-  const base = createMemoryStore();
-  return {
-    devices: base.devices.map(({ _id, ...rest }) => rest),
-    scenes: base.scenes.map(({ _id, devices, ...rest }) => ({
-      ...rest,
-      deviceActions: (devices || []).map((deviceId) => ({ deviceId, action: 'turn_on' })),
-    })),
-    automations: base.automations.map(({ _id, ...rest }) => rest),
-    voiceDevices: base.voiceDevices.map(({ _id, ...rest }) => rest),
-    profiles: base.voiceDevices.map((device, index) => ({
-      name: index === 0 ? 'Matt' : 'Guest',
-      wakeWords: index === 0 ? ['Anna', 'Henry'] : ['Home Brain'],
-      voiceId: index === 0 ? 'voice_default_anna' : 'voice_default_ben',
-      voiceName: index === 0 ? 'Anna' : 'Ben',
-      systemPrompt: index === 0 ? 'You are Anna, a friendly smart home assistant who knows the household routine.' : 'Respond warmly and guide new users through voice options.',
-      personality: index === 0 ? 'friendly' : 'helper',
-      responseStyle: index === 0 ? 'concise' : 'detailed',
-      preferredLanguage: 'en-US',
-      timezone: 'America/New_York',
-      speechRate: 1.0,
-      speechPitch: 1.0,
-      permissions: ['device_control', 'scene_control'],
-      favorites: { devices: [], scenes: [] },
-      contextMemory: true,
-      learningMode: true,
-      privacyMode: false,
-    })),
-    remoteDevices: base.remoteDevices.map(({ _id, ...rest }) => rest),
-    voiceCommands: base.voiceCommandHistory.map(({ _id, command, status, timestamp }) => ({
-      originalText: command,
-      processedText: command,
-      wakeWord: 'anna',
-      sourceRoom: 'Living Room',
-      deviceId: null,
-      intent: { action: 'device_control', confidence: 0.6, entities: {} },
-      execution: {
-        status: status === 'success' ? 'success' : 'failed',
-        startedAt: new Date(timestamp),
-        completedAt: new Date(timestamp),
-        executionTime: 0,
-        actions: [],
-      },
-      response: { text: 'Acknowledged', responseTime: 250 },
-    })),
-  };
-};
+const buildMockSmartThingsSummary = () => ({
+  connected: memoryStore.smartthings?.isConnected ?? true,
+  devices: deepClone(memoryStore.smartthings?.devices || []),
+  scenes: deepClone(memoryStore.smartthings?.scenes || []),
+});
 
-const demoSeedData = prepareSeedData();
+const getMockVoices = () => ([
+  { id: 'voice_demo_anna', name: 'Anna', labels: ['Friendly', 'Warm'] },
+  { id: 'voice_demo_henry', name: 'Henry', labels: ['Calm', 'Helpful'] },
+]);
 
-async function seedCollection(Model, items) {
-  if (!isDbConnected()) return;
-  const count = await Model.estimatedDocumentCount().catch(() => 0);
-  if (count > 0) return;
-  if (!items || !items.length) return;
-  await Model.insertMany(items);
-}
+const testMockProvider = (provider) => ({
+  provider,
+  ok: true,
+  latencyMs: 120,
+  timestamp: new Date().toISOString(),
+});
 
-async function seedDemoData() {
-  if (!isDbConnected()) {
-    console.warn('Skipping database seed because MongoDB is not connected.');
-    return;
-  }
-
-  await seedCollection(DeviceModel, demoSeedData.devices);
-  await seedCollection(SceneModel, demoSeedData.scenes);
-  await seedCollection(AutomationModel, demoSeedData.automations);
-  await seedCollection(VoiceDeviceModel, demoSeedData.voiceDevices);
-  await seedCollection(UserProfileModel, demoSeedData.profiles);
-  await seedCollection(RemoteDeviceModel, demoSeedData.remoteDevices);
-  await seedCollection(VoiceCommandModel, demoSeedData.voiceCommands);
-
-  const existingAlarm = await SecurityAlarmModel.estimatedDocumentCount().catch(() => 0);
-  if (!existingAlarm) {
-    await SecurityAlarmModel.create({
-      name: 'Home Security System',
-      alarmState: 'disarmed',
-      zones: [
-        { name: 'Front Door', deviceId: 'dev-3', deviceType: 'doorWindow', enabled: true, bypassable: true },
-        { name: 'Hallway Motion', deviceId: 'st-device-3', deviceType: 'motion', enabled: true, bypassable: true },
-      ],
-      disarmedBy: 'Demo User',
-      isOnline: true,
-    });
-  }
-
-  const integrationCount = await SmartThingsIntegrationModel.estimatedDocumentCount().catch(() => 0);
-  if (!integrationCount) {
-    await SmartThingsIntegrationModel.create({
-      clientId: process.env.SMARTTHINGS_CLIENT_ID || '',
-      clientSecret: process.env.SMARTTHINGS_CLIENT_SECRET || '',
-      redirectUri: process.env.SMARTTHINGS_REDIRECT_URI || 'http://localhost:3000/api/smartthings/callback',
-      isConfigured: false,
-      isConnected: false,
-      connectedDevices: [],
-    });
-  }
-}
-async function getSmartThingsAccessToken() {
-  const settingsToken = appSettings.smartthingsToken && appSettings.smartthingsToken.trim();
-  if (settingsToken) return settingsToken;
-
-  if (isDbConnected()) {
-    try {
-      const integration = await SmartThingsIntegrationModel.getIntegration();
-      if (integration && integration.accessToken) {
-        return integration.accessToken;
-      }
-    } catch (error) {
-      console.warn('Failed to load SmartThings integration from DB:', error.message);
-    }
-  }
-
-  return null;
-}
-
-async function smartThingsRequest(method, endpoint, { params, data } = {}) {
-  const token = await getSmartThingsAccessToken();
-  if (!token) {
-    const error = new Error('SmartThings integration is not configured');
-    error.status = 400;
-    throw error;
-  }
-
-  const url = `https://api.smartthings.com/v1${endpoint}`;
-  return axios({
-    method,
-    url,
-    params,
-    data,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 10_000,
-  });
-}
-
-function sendMockAudio(res) {
-  res.set('Content-Type', 'audio/mpeg');
-  res.send(Buffer.from(DEMO_AUDIO_BUFFER));
-}
-
-async function elevenLabsRequest(method, endpoint, options = {}) {
-  const apiKey = appSettings.elevenlabsApiKey && appSettings.elevenlabsApiKey.trim();
-  if (!apiKey) {
-    const error = new Error('ElevenLabs API key is not configured');
-    error.status = 503;
-    throw error;
-  }
-
-  const baseURL = 'https://api.elevenlabs.io/v1';
-  return axios({
-    baseURL,
-    method,
-    url: endpoint,
-    headers: {
-      'xi-api-key': apiKey,
-      'Content-Type': options.responseType === 'arraybuffer' ? 'application/json' : 'application/json',
-      ...(options.headers || {}),
-    },
-    timeout: 15_000,
-    ...options,
-  });
-}
 const app = express();
 
 const corsOptions = ACCESS_CONTROL_ALLOWLIST.length
@@ -470,7 +297,6 @@ const corsOptions = ACCESS_CONTROL_ALLOWLIST.length
 
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
 app.use(cors(corsOptions));
-app.use(rateLimit({ windowMs: 60 * 1000, max: Number(process.env.RATE_LIMIT_MAX || 120) }));
 app.use(express.json({ limit: '4mb' }));
 app.use(morgan('dev'));
 
@@ -489,96 +315,42 @@ const sendError = (res, status, message, details) => {
   if (details) body.details = details;
   return res.status(status).json(body);
 };
-const sanitizeUser = (user) => {
-  if (!user) return null;
-  const obj = user.toObject ? user.toObject() : { ...user };
-  delete obj.password;
-  delete obj.refreshToken;
-  delete obj.__v;
-  return obj;
+const DEMO_USER = Object.freeze({
+  id: 'user-demo',
+  name: 'HomeBrain Demo',
+  role: 'admin',
+});
+
+const buildDemoAuthResponse = (email = 'demo@homebrain.local') => {
+  const normalizedEmail = (email || 'demo@homebrain.local').toLowerCase();
+  return {
+    accessToken: `demo-access-${randomUUID()}`,
+    refreshToken: `demo-refresh-${randomUUID()}`,
+    user: { ...DEMO_USER, email: normalizedEmail },
+  };
 };
 
-async function buildAuthResponse(user) {
-  const tokenId = generateRefreshTokenValue();
-  user.refreshToken = tokenId;
-  user.lastLoginAt = new Date();
-  await user.save();
-
-  const payload = { sub: user._id.toString(), email: user.email, role: user.role };
-  const accessToken = issueAccessToken(payload);
-  const refreshToken = issueRefreshToken({ ...payload, tokenId });
-
-  return {
-    accessToken,
-    refreshToken,
-    user: sanitizeUser(user),
-  };
-}
-
-async function authenticateCredentials(email, password) {
-  const user = await UserModel.findOne({ email: email.toLowerCase() });
-  if (!user) {
-    return null;
-  }
-
-  const passwordMatches = await comparePassword(password, user.password);
-  if (!passwordMatches) {
-    return null;
-  }
-
-  if (!user.isActive) {
-    const error = new Error('Account is disabled');
-    error.status = 403;
-    throw error;
-  }
-
-  return user;
-}
 app.get('/api/ping', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.post('/api/auth/register', asyncHandler(async (req, res) => {
-  const { email, password, role } = req.body || {};
-  if (!email || !password) {
-    return sendError(res, 400, 'Email and password are required');
+  const { email } = req.body || {};
+  if (!email) {
+    return sendError(res, 400, 'Email is required');
   }
 
-  if (!validatePassword(password)) {
-    return sendError(res, 400, 'Password must be at least 8 characters and include letters and numbers');
-  }
-
-  const existingUser = await UserModel.findOne({ email: email.toLowerCase() });
-  if (existingUser) {
-    return sendError(res, 409, 'An account with this email already exists');
-  }
-
-  const hashedPassword = await hashPassword(password);
-  const isFirstUser = (await UserModel.estimatedDocumentCount().catch(() => 0)) === 0;
-  const userRole = isFirstUser ? ROLES.ADMIN : (role && Object.values(ROLES).includes(role) ? role : ROLES.USER);
-
-  const user = await UserModel.create({
-    email: email.toLowerCase(),
-    password: hashedPassword,
-    role: userRole,
-  });
-
-  const authPayload = await buildAuthResponse(user);
+  const authPayload = buildDemoAuthResponse(email);
   return sendSuccess(res, authPayload, 201);
 }));
 
 app.post('/api/auth/login', asyncHandler(async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) {
-    return sendError(res, 400, 'Email and password are required');
+  const { email } = req.body || {};
+  if (!email) {
+    return sendError(res, 400, 'Email is required');
   }
 
-  const user = await authenticateCredentials(email, password);
-  if (!user) {
-    return sendError(res, 401, 'Invalid email or password');
-  }
-
-  const authPayload = await buildAuthResponse(user);
+  const authPayload = buildDemoAuthResponse(email);
   return sendSuccess(res, authPayload);
 }));
 
@@ -588,28 +360,11 @@ app.post('/api/auth/refresh', asyncHandler(async (req, res) => {
     return sendError(res, 400, 'refreshToken is required');
   }
 
-  let decoded;
-  try {
-    decoded = verifyRefreshToken(refreshToken);
-  } catch (error) {
-    return sendError(res, 401, 'Invalid or expired refresh token');
-  }
-
-  const user = await UserModel.findById(decoded.sub);
-  if (!user || user.refreshToken !== decoded.tokenId) {
-    return sendError(res, 401, 'Refresh token is no longer valid');
-  }
-
-  const authPayload = await buildAuthResponse(user);
+  const authPayload = buildDemoAuthResponse();
   return sendSuccess(res, authPayload);
 }));
-app.use(authMiddleware);
-app.post('/api/auth/logout', asyncHandler(async (req, res) => {
-  if (!req.user) {
-    return sendError(res, 401, 'Not authenticated');
-  }
 
-  await UserModel.findByIdAndUpdate(req.user.id, { refreshToken: generateRefreshTokenValue() }).catch(() => null);
+app.post('/api/auth/logout', asyncHandler(async (_req, res) => {
   return sendSuccess(res, { message: 'Logged out' });
 }));
 const SENSITIVE_PLACEHOLDER_PATTERN = /^\u0007+/;
@@ -667,12 +422,8 @@ app.post('/api/settings/test-elevenlabs', asyncHandler(async (req, res) => {
     await writeSettingsPersisted({ elevenlabsApiKey: apiKey });
   }
 
-  try {
-    const response = await elevenLabsRequest('get', '/voices', { params: { page_size: 1 } });
-    return sendSuccess(res, { success: true, message: 'ElevenLabs key OK', voiceCount: response.data?.voices?.length || 0 });
-  } catch (error) {
-    return sendError(res, error.response?.status || 500, error.response?.data?.message || 'Failed to reach ElevenLabs');
-  }
+  const voices = getMockVoices();
+  return sendSuccess(res, { success: true, message: 'ElevenLabs key accepted (mock)', voiceCount: voices.length, voices });
 }));
 
 app.post('/api/settings/test-openai', asyncHandler(async (req, res) => {
@@ -682,26 +433,13 @@ app.post('/api/settings/test-openai', asyncHandler(async (req, res) => {
     return sendError(res, 400, 'apiKey required');
   }
 
-  try {
-    const response = await axios({
-      method: 'post',
-      url: 'https://api.openai.com/v1/chat/completions',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-      },
-      data: {
-        model: model || appSettings.openaiModel || 'gpt-3.5-turbo',
-        messages: [{ role: 'system', content: 'You are HomeBrain.' }, { role: 'user', content: 'Ping' }],
-        max_tokens: 5,
-      },
-      timeout: 10_000,
-    });
-    return sendSuccess(res, { success: true, message: 'OpenAI key OK', model: response.data?.model });
-  } catch (error) {
-    const status = error.response?.status || 500;
-    return sendError(res, status, error.response?.data?.error?.message || 'Failed to reach OpenAI');
+  const result = testMockProvider('openai');
+  appSettings.openaiApiKey = key;
+  if (model) {
+    appSettings.openaiModel = model;
   }
+  await writeSettingsPersisted({ openaiApiKey: key, ...(model ? { openaiModel: model } : {}) });
+  return sendSuccess(res, { success: true, message: 'OpenAI key accepted (mock)', model: model || appSettings.openaiModel, result });
 }));
 
 app.post('/api/settings/test-anthropic', asyncHandler(async (req, res) => {
@@ -711,27 +449,13 @@ app.post('/api/settings/test-anthropic', asyncHandler(async (req, res) => {
     return sendError(res, 400, 'apiKey required');
   }
 
-  try {
-    const response = await axios({
-      method: 'post',
-      url: 'https://api.anthropic.com/v1/messages',
-      headers: {
-        'x-api-key': key,
-        'Content-Type': 'application/json',
-        'anthropic-version': '2023-06-01',
-      },
-      data: {
-        model: model || appSettings.anthropicModel || 'claude-3-sonnet-20240229',
-        max_tokens: 5,
-        messages: [{ role: 'user', content: 'Ping' }],
-      },
-      timeout: 10_000,
-    });
-    return sendSuccess(res, { success: true, message: 'Anthropic key OK', model: response.data?.model });
-  } catch (error) {
-    const status = error.response?.status || 500;
-    return sendError(res, status, error.response?.data?.error?.message || 'Failed to reach Anthropic');
+  const result = testMockProvider('anthropic');
+  appSettings.anthropicApiKey = key;
+  if (model) {
+    appSettings.anthropicModel = model;
   }
+  await writeSettingsPersisted({ anthropicApiKey: key, ...(model ? { anthropicModel: model } : {}) });
+  return sendSuccess(res, { success: true, message: 'Anthropic key accepted (mock)', model: model || appSettings.anthropicModel, result });
 }));
 
 app.post('/api/settings/test-local-llm', asyncHandler(async (req, res) => {
@@ -741,27 +465,23 @@ app.post('/api/settings/test-local-llm', asyncHandler(async (req, res) => {
     return sendError(res, 400, 'endpoint required');
   }
 
-  try {
-    const response = await axios({
-      method: 'post',
-      url,
-      data: { prompt: 'ping', model: model || appSettings.localLlmModel },
-      timeout: 5_000,
-    });
-    return sendSuccess(res, { success: true, message: 'Local LLM reachable', endpoint: url, model: model || appSettings.localLlmModel, info: response.data });
-  } catch (error) {
-    return sendError(res, error.response?.status || 500, error.message || 'Failed to reach local LLM endpoint');
+  const result = testMockProvider('local-llm');
+  if (endpoint) {
+    appSettings.localLlmEndpoint = endpoint;
   }
+  if (model) {
+    appSettings.localLlmModel = model;
+  }
+  await writeSettingsPersisted({
+    ...(endpoint ? { localLlmEndpoint: endpoint } : {}),
+    ...(model ? { localLlmModel: model } : {}),
+  });
+  return sendSuccess(res, { success: true, message: 'Local LLM endpoint recorded (mock)', endpoint: url, model: model || appSettings.localLlmModel, result });
 }));
 
-app.post('/api/settings/test-smartthings', asyncHandler(async (req, res) => {
-  try {
-    const response = await smartThingsRequest('get', '/devices', { params: { max: 1 } });
-    return sendSuccess(res, { success: true, message: 'SmartThings connection OK', deviceCount: response.data?.items?.length || 0 });
-  } catch (error) {
-    const status = error.status || error.response?.status || 500;
-    return sendError(res, status, error.response?.data?.message || error.message || 'Failed to reach SmartThings');
-  }
+app.post('/api/settings/test-smartthings', asyncHandler(async (_req, res) => {
+  const summary = buildMockSmartThingsSummary();
+  return sendSuccess(res, { success: true, message: 'SmartThings integration mocked', deviceCount: summary.devices.length, summary });
 }));
 app.get('/api/devices', asyncHandler(async (req, res) => {
   const { room, type, status, isOnline } = req.query || {};
