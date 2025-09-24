@@ -1097,3 +1097,51 @@ app.get('/api/voice/devices/status/:status', asyncHandler(async (req, res) => {
   return sendSuccess(res, { success: true, devices, status, count: devices.length });
 }));
 
+const HOST = process.env.HOST || '0.0.0.0';
+const PORT = Number(process.env.PORT || 3000);
+const SETTINGS_DB_URI = process.env.DATABASE_URL || process.env.MONGODB_URI || null;
+const SETTINGS_DB_TIMEOUT_MS = Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 2000);
+const SETTINGS_DB_OPTIONS = { serverSelectionTimeoutMS: SETTINGS_DB_TIMEOUT_MS };
+
+
+async function startServer() {
+  if (SETTINGS_DB_URI) {
+    if (mongoose.connection.readyState === 0) {
+      try {
+        await mongoose.connect(SETTINGS_DB_URI, SETTINGS_DB_OPTIONS);
+        console.log(`Settings database connected (${mongoose.connection.host}/${mongoose.connection.name})`);
+      } catch (error) {
+        console.warn('Settings database connection failed; continuing with file persistence only.', error.message);
+      }
+    } else if (mongoose.connection.readyState === 1) {
+      console.log('Settings database already connected.');
+    }
+  } else {
+    console.log('Settings DB URI not provided; using file persistence.');
+  }
+
+  app.listen(PORT, HOST, () => {
+    console.log(`HomeBrain API listening on http://${HOST}:${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('Failed to start HomeBrain server:', error);
+  process.exit(1);
+});
+
+async function gracefulShutdown(signal) {
+  console.log(`HomeBrain server received ${signal}; shutting down...`);
+  if (mongoose.connection.readyState === 1) {
+    try {
+      await mongoose.connection.close();
+      console.log('Settings database connection closed.');
+    } catch (error) {
+      console.warn('Error closing settings database connection:', error.message);
+    }
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
