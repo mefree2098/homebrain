@@ -269,11 +269,70 @@ const writeUserProfilesToDisk = (profiles) => {
   }
 };
 
-const persistedUserProfiles = readUserProfilesFromDisk();
-if (Array.isArray(persistedUserProfiles)) {
-  memoryStore.userProfiles = persistedUserProfiles;
-  console.log(`Loaded ${persistedUserProfiles.length} user profile(s) from disk cache.`);
-}
+const loadUserProfilesFromDisk = ({ log = true } = {}) => {
+  const persisted = readUserProfilesFromDisk();
+  if (Array.isArray(persisted)) {
+    memoryStore.userProfiles = persisted;
+    if (log) {
+      console.log(`Loaded ${persisted.length} user profile(s) from disk cache.`);
+    }
+  } else {
+    memoryStore.userProfiles = [];
+    if (log) {
+      console.log('No persisted user profiles found on disk; starting fresh.');
+    }
+  }
+};
+
+loadUserProfilesFromDisk();
+
+const getMemoryStoreCounts = () => ({
+  devices: memoryStore.devices.length,
+  scenes: memoryStore.scenes.length,
+  automations: memoryStore.automations.length,
+  voiceDevices: memoryStore.voiceDevices.length,
+  userProfiles: memoryStore.userProfiles.length,
+  voiceCommands: memoryStore.voiceCommandHistory.length,
+  securityAlarms: memoryStore.security?.alarm ? 1 : 0,
+});
+
+const resetMemoryStore = ({ includeSamples = true, loadProfiles = true } = {}) => {
+  let newStore = createMemoryStore();
+
+  if (!includeSamples) {
+    newStore.devices = [];
+    newStore.scenes = [];
+    newStore.automations = [];
+    newStore.voiceDevices = [];
+    newStore.voiceCommandHistory = [];
+    newStore.remoteDevices = [];
+    newStore.discovery = { enabled: false, lastScan: null, autoApproveRooms: [], pendingDevices: [] };
+    newStore.smartthings = { devices: [], scenes: [] };
+    newStore.security = {
+      status: {
+        alarmState: 'disarmed',
+        isArmed: false,
+        isTriggered: false,
+        isOnline: false,
+        zoneCount: 0,
+        activeZones: 0,
+        bypassedZones: 0,
+        lastArmed: null,
+        lastDisarmed: null,
+        armedBy: null,
+        lastTriggered: null,
+      },
+      alarm: null,
+    };
+  }
+
+  memoryStore = newStore;
+  if (loadProfiles) {
+    loadUserProfilesFromDisk({ log: false });
+  } else {
+    memoryStore.userProfiles = [];
+  }
+};
 
 async function readSettingsPersisted() {
   if (isSettingsDbConnected()) {
@@ -1096,6 +1155,33 @@ app.put('/api/security-alarm/configure', asyncHandler(async (req, res) => {
   return sendSuccess(res, {
     message: 'Security alarm configured',
     alarm: deepClone(memoryStore.security.alarm),
+  });
+}));
+
+app.delete('/api/maintenance/fake-data', asyncHandler(async (_req, res) => {
+  const snapshot = getMemoryStoreCounts();
+  resetMemoryStore({ includeSamples: false, loadProfiles: false });
+  writeUserProfilesToDisk(memoryStore.userProfiles);
+
+  return sendSuccess(res, { message: 'Demo data cleared', results: snapshot });
+}));
+
+app.post('/api/maintenance/fake-data', asyncHandler(async (_req, res) => {
+  resetMemoryStore({ includeSamples: true, loadProfiles: true });
+  const snapshot = getMemoryStoreCounts();
+
+  return sendSuccess(res, { message: 'Demo data reloaded', results: snapshot });
+}));
+
+app.post('/api/maintenance/sync/insteon', asyncHandler(async (_req, res) => {
+  if (!appSettings.insteonPort) {
+    return sendError(res, 400, 'Insteon PLM port not configured in settings');
+  }
+
+  return sendSuccess(res, {
+    message: 'Insteon sync dispatched (demo mode)',
+    deviceCount: 0,
+    note: 'Real Insteon discovery requires the Python PLM bridge service to be running on the Jetson.',
   });
 }));
 
