@@ -44,6 +44,20 @@ export const forceSmartThingsSync = async () => {
   }
 };
 
+// Description: Test INSTEON connection
+// Endpoint: POST /api/maintenance/test-insteon
+// Request: {}
+// Response: { success: boolean, message: string, port: string }
+export const testInsteonConnection = async () => {
+  try {
+    const response = await api.post('/api/maintenance/test-insteon');
+    return response.data;
+  } catch (error) {
+    console.error(error);
+    throw new Error(error?.response?.data?.message || error?.response?.data?.error || error.message);
+  }
+};
+
 // Description: Force re-sync all devices from INSTEON
 // Endpoint: POST /api/maintenance/sync/insteon
 // Request: {}

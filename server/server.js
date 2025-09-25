@@ -1159,21 +1159,32 @@ app.put('/api/security-alarm/configure', asyncHandler(async (req, res) => {
 }));
 
 app.delete('/api/maintenance/fake-data', asyncHandler(async (_req, res) => {
-  const snapshot = getMemoryStoreCounts();
+  const before = getMemoryStoreCounts();
   resetMemoryStore({ includeSamples: false, loadProfiles: false });
   writeUserProfilesToDisk(memoryStore.userProfiles);
+  const after = getMemoryStoreCounts();
 
-  return sendSuccess(res, { message: 'Demo data cleared', results: snapshot });
+  return sendSuccess(res, {
+    message: 'Demo data cleared',
+    results: { before, after, cleared: before },
+    shouldReload: true,
+  });
 }));
 
 app.post('/api/maintenance/fake-data', asyncHandler(async (_req, res) => {
+  const before = getMemoryStoreCounts();
   resetMemoryStore({ includeSamples: true, loadProfiles: true });
-  const snapshot = getMemoryStoreCounts();
+  const after = getMemoryStoreCounts();
 
-  return sendSuccess(res, { message: 'Demo data reloaded', results: snapshot });
+  return sendSuccess(res, {
+    message: 'Demo data reloaded',
+    results: { before, after, injected: after },
+    shouldReload: true,
+  });
 }));
 
 app.post('/api/maintenance/sync/insteon', asyncHandler(async (_req, res) => {
+  await ensureSettingsLoaded();
   if (!appSettings.insteonPort) {
     return sendError(res, 400, 'Insteon PLM port not configured in settings');
   }
@@ -1183,6 +1194,40 @@ app.post('/api/maintenance/sync/insteon', asyncHandler(async (_req, res) => {
     deviceCount: 0,
     note: 'Real Insteon discovery requires the Python PLM bridge service to be running on the Jetson.',
   });
+}));
+
+app.post('/api/maintenance/test-insteon', asyncHandler(async (_req, res) => {
+  await ensureSettingsLoaded();
+  const port = appSettings.insteonPort;
+  if (!port) {
+    return sendError(res, 400, 'Insteon PLM port not configured in settings');
+  }
+
+  try {
+    await fsPromises.access(port, fs.constants.R_OK | fs.constants.W_OK);
+    let fd;
+    try {
+      fd = fs.openSync(port, fs.constants.O_RDWR);
+    } finally {
+      if (typeof fd === 'number') {
+        fs.closeSync(fd);
+      }
+    }
+
+    return sendSuccess(res, {
+      message: `Successfully opened PLM port ${port}`,
+      port,
+    });
+  } catch (error) {
+    const status = ['ENOENT', 'ENOTDIR'].includes(error.code) ? 404
+      : (error.code === 'EACCES' ? 403 : 500);
+    const message = error.code === 'ENOENT'
+      ? `PLM device not found at ${port}`
+      : (error.code === 'EACCES'
+        ? `Permission denied reading ${port}. Ensure the service has access to the serial device.`
+        : error.message);
+    return sendError(res, status, message, { code: error.code });
+  }
 }));
 
 app.get('/api/profiles', asyncHandler(async (_req, res) => {

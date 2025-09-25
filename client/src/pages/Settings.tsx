@@ -30,7 +30,8 @@ import {
   FileDown,
   Activity,
   HardDrive,
-  Wrench
+  Wrench,
+  PlugZap
 } from "lucide-react"
 import { useToast } from "@/hooks/useToast"
 import { useForm } from "react-hook-form"
@@ -55,6 +56,7 @@ import {
   injectFakeData,
   forceSmartThingsSync,
   forceInsteonSync,
+  testInsteonConnection,
   clearSmartThingsDevices,
   clearInsteonDevices,
   resetSettingsToDefaults,
@@ -81,6 +83,7 @@ export function Settings() {
   const [injectingFakeData, setInjectingFakeData] = useState(false)
   const [syncingSmartThings, setSyncingSmartThings] = useState(false)
   const [syncingInsteon, setSyncingInsteon] = useState(false)
+  const [testingInsteon, setTestingInsteon] = useState(false)
   const [clearingSTDevices, setClearingSTDevices] = useState(false)
   const [clearingInsteonDevices, setClearingInsteonDevices] = useState(false)
   const [resettingSettings, setResettingSettings] = useState(false)
@@ -610,10 +613,15 @@ export function Settings() {
       const response = await clearAllFakeData();
 
       if (response.success) {
+        const clearedCounts = response.results?.cleared || response.results?.before || response.results || {};
+        const clearedTotal = Object.values(clearedCounts).reduce((acc: number, value: any) => acc + Number(value || 0), 0);
         toast({
           title: "Data Cleared",
-          description: `Successfully cleared ${Object.values(response.results).reduce((a, b) => a + b, 0)} items`
+          description: `Successfully cleared ${clearedTotal} items`
         });
+        if (response.shouldReload) {
+          setTimeout(() => window.location.reload(), 400);
+        }
       }
     } catch (error) {
       console.error('Clear fake data failed:', error);
@@ -634,10 +642,15 @@ export function Settings() {
       const response = await injectFakeData();
 
       if (response.success) {
+        const injectedCounts = response.results?.injected || response.results?.after || response.results || {};
+        const injectedTotal = Object.values(injectedCounts).reduce((acc: number, value: any) => acc + Number(value || 0), 0);
         toast({
           title: "Data Injected",
-          description: `Successfully injected ${Object.values(response.results).reduce((a, b) => a + b, 0)} items`
+          description: `Successfully injected ${injectedTotal} items`
         });
+        if (response.shouldReload) {
+          setTimeout(() => window.location.reload(), 400);
+        }
       }
     } catch (error) {
       console.error('Inject fake data failed:', error);
@@ -696,6 +709,27 @@ export function Settings() {
       });
     } finally {
       setSyncingInsteon(false);
+    }
+  };
+
+  const handleTestInsteonConnection = async () => {
+    setTestingInsteon(true);
+    try {
+      console.log('Testing INSTEON connection...');
+      const response = await testInsteonConnection();
+      toast({
+        title: 'PLM Reachable',
+        description: response.message || `Successfully opened ${response.port}`
+      });
+    } catch (error) {
+      console.error('INSTEON test failed:', error);
+      toast({
+        title: 'Test Failed',
+        description: error.message || 'Unable to communicate with the INSTEON PLM',
+        variant: 'destructive'
+      });
+    } finally {
+      setTestingInsteon(false);
     }
   };
 
@@ -1648,7 +1682,7 @@ export function Settings() {
                 {/* INSTEON Operations */}
                 <div className="space-y-4">
                   <h4 className="font-medium text-purple-600">INSTEON Operations</h4>
-                  <div className="grid gap-4 md:grid-cols-2">
+                  <div className="grid gap-4 md:grid-cols-3">
                     <Button
                       type="button"
                       variant="outline"
@@ -1666,6 +1700,27 @@ export function Settings() {
                         <>
                           <RefreshCw className="h-4 w-4 mr-2" />
                           Force Sync
+                        </>
+                      )}
+                    </Button>
+
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleTestInsteonConnection}
+                      disabled={testingInsteon}
+                      className="w-full"
+                    >
+                      {testingInsteon ? (
+                        <>
+                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-600 mr-2" />
+                          Testing...
+                        </>
+                      ) : (
+                        <>
+                          <PlugZap className="h-4 w-4 mr-2" />
+                          Test Connection
                         </>
                       )}
                     </Button>
