@@ -718,8 +718,8 @@ export function Settings() {
       console.log('Testing INSTEON connection...');
       const response = await testInsteonConnection();
       toast({
-        title: 'PLM Reachable',
-        description: response.message || `Successfully opened ${response.port}`
+        title: response.bridge?.url ? 'Bridge Reachable' : 'PLM Reachable',
+        description: response.message || (response.bridge?.url ? `Bridge responded from ${response.bridge.url}` : `Successfully opened ${response.port}`)
       });
     } catch (error) {
       console.error('INSTEON test failed:', error);
