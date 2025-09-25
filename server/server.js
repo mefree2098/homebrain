@@ -755,6 +755,8 @@ app.use(morgan('dev'));
 let server;
 let logServer;
 let isShuttingDown = false;
+const MAX_LOG_PAYLOAD = Number(process.env.CLIENT_LOG_MAX_ENTRIES || 200);
+
 const sendSuccess = (res, payload = {}, status = 200) => {
   if (payload.success === undefined) {
     payload = { success: true, ...payload };
