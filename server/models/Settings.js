@@ -46,6 +46,22 @@ const SettingsSchema = new mongoose.Schema({
     type: String,
     default: '/dev/ttyUSB0'
   },
+  insteonEnabled: {
+    type: Boolean,
+    default: false
+  },
+  insteonBridgeUrl: {
+    type: String,
+    default: 'http://127.0.0.1:8765'
+  },
+  insteonPollInterval: {
+    type: Number,
+    default: 15000
+  },
+  insteonAuthToken: {
+    type: String,
+    default: ''
+  },
   smartthingsToken: {
     type: String,
     default: ''
@@ -182,6 +198,9 @@ SettingsSchema.methods.toSanitized = function() {
   }
   if (sanitized.anthropicApiKey) {
     sanitized.anthropicApiKey = sanitized.anthropicApiKey.replace(/.(?=.{4})/g, '*');
+  }
+  if (sanitized.insteonAuthToken) {
+    sanitized.insteonAuthToken = sanitized.insteonAuthToken.replace(/.(?=.{4})/g, '*');
   }
   
   return sanitized;

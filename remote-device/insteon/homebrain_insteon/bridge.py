@@ -6,17 +6,20 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:  # pyinsteon is optional for documentation builds
     from pyinsteon import async_connect
+    from pyinsteon.constants import DeviceAction
 except Exception:  # pragma: no cover - library missing in dev env
     async_connect = None  # type: ignore
+    DeviceAction = None  # type: ignore
 
 from .config import BridgeConfig
-from .devices import device_to_snapshot, snapshot_collection
+from .devices import device_to_snapshot
 
 
 class BridgeNotConnected(Exception):
@@ -36,8 +39,12 @@ class InsteonBridge:
         self.log = logging.getLogger("homebrain.insteon.bridge")
         self.log.setLevel(self.config.log_level.upper())
 
+        self._device_manager: Any = None
         self._modem: Any = None
-        self._connection: Any = None
+
+        self._manager_subscription: Optional[Callable[..., None]] = None
+        self._device_callbacks: Dict[str, List[Tuple[Any, Callable[..., None]]]] = {}
+        self._device_objects: Dict[str, Any] = {}
 
         self._connect_task: Optional[asyncio.Task] = None
         self._event_dispatch_task: Optional[asyncio.Task] = None
@@ -79,19 +86,12 @@ class InsteonBridge:
         tasks = [t for t in (self._connect_task, self._event_dispatch_task) if t]
         for task in tasks:
             task.cancel()
-        if self._connection:
-            try:
-                await asyncio.wait_for(self._connection.close(), timeout=5)
-            except Exception:
-                pass
-        self._connection = None
-        self._modem = None
-        self._connected_event.clear()
         for task in tasks:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+        await self._cleanup_after_disconnect()
         self.log.info("Insteon bridge stopped")
 
     async def wait_until_connected(self, timeout: Optional[float] = None) -> bool:
@@ -117,16 +117,10 @@ class InsteonBridge:
             sleep_delay = base_backoff
             try:
                 self.log.info("Connecting to Insteon PLM on %s (attempt %s)", self.config.serial_port, self._status["connect_attempts"])
-                modem, connection = await async_connect(device=self.config.serial_port)
-                self._modem, self._connection = modem, connection
-                self._status["connected"] = True
-                self._status["successful_connects"] += 1
-                self._status["last_error"] = None
-                self._connected_event.set()
+                manager = await async_connect(device=self.config.serial_port)
+                await self._on_connected(manager)
                 backoff = base_backoff
                 sleep_delay = 0.0
-                await self._publish_event({"type": "bridge_status", "connected": True, "port": self.config.serial_port})
-                self.log.info("Connected to PLM; known devices: %s", len(getattr(modem, "devices", {})))
                 await self._stop_event.wait()
             except asyncio.CancelledError:
                 raise
@@ -142,15 +136,7 @@ class InsteonBridge:
                 })
                 sleep_delay = backoff
             finally:
-                if self._connection:
-                    try:
-                        await asyncio.wait_for(self._connection.close(), timeout=5)
-                    except Exception:
-                        pass
-                self._connection = None
-                self._modem = None
-                self._connected_event.clear()
-                self._status["connected"] = False
+                await self._cleanup_after_disconnect()
                 if self._stop_event.is_set():
                     break
                 if sleep_delay > 0:
@@ -168,11 +154,284 @@ class InsteonBridge:
             return
 
     # ------------------------------------------------------------------
+    async def _on_connected(self, manager: Any) -> None:
+        self._device_manager = manager
+        self._modem = getattr(manager, "modem", None)
+        self._status["connected"] = True
+        self._status["successful_connects"] += 1
+        self._status["last_error"] = None
+        self._connected_event.set()
+
+        if hasattr(manager, "subscribe"):
+            self._manager_subscription = self._handle_device_manager_event
+            try:
+                manager.subscribe(self._manager_subscription, force_strong_ref=True)
+            except Exception:
+                self._manager_subscription = None
+
+        await self._publish_event({
+            "type": "bridge_status",
+            "connected": True,
+            "port": self.config.serial_port,
+        })
+
+        await self._prime_device_cache(manager)
+
+    async def _cleanup_after_disconnect(self) -> None:
+        manager = self._device_manager
+        modem = self._modem
+        subscription = self._manager_subscription
+
+        if manager and subscription and hasattr(manager, "unsubscribe"):
+            with suppress(Exception):
+                manager.unsubscribe(subscription)
+        self._manager_subscription = None
+
+        self._clear_device_callbacks()
+        self._device_objects.clear()
+
+        was_connected = self._connected_event.is_set()
+        self._device_manager = None
+        self._modem = None
+        self._connected_event.clear()
+        self._status["connected"] = False
+
+        if manager and hasattr(manager, "async_close"):
+            with suppress(Exception):
+                await asyncio.wait_for(manager.async_close(), timeout=5)
+        if modem and hasattr(modem, "async_close"):
+            with suppress(Exception):
+                await asyncio.wait_for(modem.async_close(), timeout=5)
+
+        if was_connected:
+            await self._publish_event({
+                "type": "bridge_status",
+                "connected": False,
+                "port": self.config.serial_port,
+            })
+
+    async def _prime_device_cache(self, manager: Any) -> None:
+        snapshots: List[Dict[str, Any]] = []
+        devices_iterable: Iterable[Any] = []
+        try:
+            values = getattr(manager, "values", None)
+            if callable(values):
+                devices_iterable = list(values())
+        except Exception:
+            devices_iterable = []
+
+        for device in devices_iterable:
+            if self._modem and device is self._modem:
+                continue
+            snapshot = await self._register_device(device, persist=False)
+            if snapshot:
+                snapshots.append(snapshot)
+
+        if snapshots:
+            async with self._device_cache_lock:
+                self._status["device_count"] = len(self._device_cache)
+                self._status["last_discovery"] = time.time()
+            self._persist_device_cache()
+            await self._publish_event({
+                "type": "device_snapshot",
+                "count": len(snapshots),
+                "devices": snapshots,
+            })
+        self.log.info("Connected to PLM; known devices: %s", len(snapshots))
+
+    async def _register_device(self, device: Any, *, persist: bool = True) -> Optional[Dict[str, Any]]:
+        snapshot = await self._update_cached_device(device, persist=persist)
+        device_id = snapshot.get("id") if snapshot else None
+        if not device_id:
+            return snapshot
+
+        await self._unregister_device(device_id, drop=False)
+
+        callbacks: List[Tuple[Any, Callable[..., None]]] = []
+
+        events = getattr(device, "events", {}) or {}
+        if isinstance(events, dict):
+            for group_events in events.values():
+                if not isinstance(group_events, dict):
+                    continue
+                for event_name, event_obj in group_events.items():
+                    if not hasattr(event_obj, "subscribe"):
+                        continue
+                    callback = self._make_event_callback(device_id, event_name)
+                    try:
+                        event_obj.subscribe(callback, force_strong_ref=True)
+                        callbacks.append((event_obj, callback))
+                    except Exception:
+                        self.log.debug("Failed to subscribe to %s event on %s", event_name, device_id, exc_info=True)
+
+        groups = getattr(device, "groups", {}) or {}
+        if isinstance(groups, dict):
+            for group in groups.values():
+                if not hasattr(group, "subscribe"):
+                    continue
+                group_name = getattr(group, "name", "state")
+                callback = self._make_group_callback(device_id, group_name)
+                try:
+                    group.subscribe(callback, force_strong_ref=True)
+                    callbacks.append((group, callback))
+                except Exception:
+                    self.log.debug("Failed to subscribe to group %s on %s", group_name, device_id, exc_info=True)
+
+        if callbacks:
+            self._device_callbacks[device_id] = callbacks
+
+        return snapshot
+
+    async def _unregister_device(self, device_id: str, *, drop: bool) -> None:
+        callbacks = self._device_callbacks.pop(device_id, [])
+        for source, callback in callbacks:
+            if hasattr(source, "unsubscribe"):
+                with suppress(Exception):
+                    source.unsubscribe(callback)
+        if drop:
+            self._device_objects.pop(device_id, None)
+            removed = None
+            async with self._device_cache_lock:
+                removed = self._device_cache.pop(device_id, None)
+                self._status["device_count"] = len(self._device_cache)
+            if removed is not None:
+                self._persist_device_cache()
+
+    async def _update_cached_device(self, device: Any, *, persist: bool = True) -> Dict[str, Any]:
+        snapshot = device_to_snapshot(device).to_dict()
+        device_id = snapshot.get("id")
+        if not device_id:
+            return snapshot
+        normalized = self._normalize_device_id(device_id)
+        snapshot["id"] = normalized
+        snapshot["address"] = normalized
+        self._device_objects[normalized] = device
+        async with self._device_cache_lock:
+            self._device_cache[normalized] = snapshot
+            self._status["device_count"] = len(self._device_cache)
+        if persist:
+            self._persist_device_cache()
+        return snapshot
+
+    def _clear_device_callbacks(self) -> None:
+        for source, callback in [item for callbacks in self._device_callbacks.values() for item in callbacks]:
+            if hasattr(source, "unsubscribe"):
+                with suppress(Exception):
+                    source.unsubscribe(callback)
+        self._device_callbacks.clear()
+
+    def _make_event_callback(self, device_id: str, event_name: str) -> Callable[..., None]:
+        def handler(name: str, address: str, group: int, button: str = "", **_: Any) -> None:
+            payload = {
+                "device_id": self._normalize_device_id(device_id),
+                "event": name or event_name,
+                "group": group,
+                "button": button or None,
+            }
+            self.loop.call_soon_threadsafe(self._handle_device_event_notification, payload)
+
+        return handler
+
+    def _make_group_callback(self, device_id: str, group_name: str) -> Callable[..., None]:
+        def handler(name: str, address: str, value: Any, group: int, **_: Any) -> None:
+            payload = {
+                "device_id": self._normalize_device_id(device_id),
+                "name": name or group_name,
+                "group": group,
+                "value": value,
+            }
+            self.loop.call_soon_threadsafe(self._handle_group_notification, payload)
+
+        return handler
+
+    def _handle_device_manager_event(self, **payload: Any) -> None:
+        if DeviceAction is None:
+            return
+        action = payload.get("action")
+        address = payload.get("address")
+        if not address:
+            return
+        normalized = self._normalize_device_id(address)
+        if action == DeviceAction.ADDED:
+            self.loop.create_task(self._handle_device_added(normalized))
+        elif action == DeviceAction.REMOVED:
+            self.loop.create_task(self._handle_device_removed(normalized))
+
+    async def _handle_device_added(self, device_id: str) -> None:
+        device = self._find_device_by_id(device_id)
+        if not device:
+            return
+        snapshot = await self._register_device(device, persist=True)
+        await self._publish_event({
+            "type": "device_added",
+            "device": snapshot,
+        })
+
+    async def _handle_device_removed(self, device_id: str) -> None:
+        await self._unregister_device(device_id, drop=True)
+        await self._publish_event({
+            "type": "device_removed",
+            "device_id": device_id,
+        })
+
+    def _handle_device_event_notification(self, payload: Dict[str, Any]) -> None:
+        self.loop.create_task(self._process_device_event(payload))
+
+    def _handle_group_notification(self, payload: Dict[str, Any]) -> None:
+        self.loop.create_task(self._process_group_event(payload))
+
+    async def _process_device_event(self, payload: Dict[str, Any]) -> None:
+        device_id = payload.get("device_id")
+        if not device_id:
+            return
+        device = self._device_objects.get(device_id) or self._find_device_by_id(device_id)
+        snapshot = None
+        if device:
+            snapshot = await self._update_cached_device(device, persist=False)
+        event_payload = {"type": "device_event", **payload}
+        if snapshot:
+            event_payload["device"] = snapshot
+        await self._publish_event(event_payload)
+
+    async def _process_group_event(self, payload: Dict[str, Any]) -> None:
+        device_id = payload.get("device_id")
+        if not device_id:
+            return
+        device = self._device_objects.get(device_id) or self._find_device_by_id(device_id)
+        snapshot = None
+        if device:
+            snapshot = await self._update_cached_device(device, persist=False)
+        state_payload = {"type": "device_state", **payload}
+        if snapshot:
+            state_payload["device"] = snapshot
+        await self._publish_event(state_payload)
+
+    def _find_device_by_id(self, device_id: str) -> Optional[Any]:
+        normalized = self._normalize_device_id(device_id)
+        if normalized in self._device_objects:
+            return self._device_objects[normalized]
+        manager = self._device_manager
+        if not manager or not hasattr(manager, "values"):
+            return None
+        with suppress(Exception):
+            for device in manager.values():
+                address = getattr(device, "address", None)
+                candidate = getattr(address, "id", None)
+                if candidate and self._normalize_device_id(candidate) == normalized:
+                    return device
+        return None
+
+    @staticmethod
+    def _normalize_device_id(address: str) -> str:
+        return str(address).replace(".", "").replace(":", "").lower()
+
+    # ------------------------------------------------------------------
     # Discovery and device registry
     # ------------------------------------------------------------------
     async def run_discovery(self, refresh: Optional[bool] = None) -> Dict[str, Any]:
         refresh = self.config.discovery_refresh_default if refresh is None else refresh
-        if not self._modem:
+        manager = self._device_manager
+        if not manager:
             if self.config.allow_mock_mode:
                 self.log.info("Discovery requested in mock mode; returning cached devices only")
                 async with self._device_cache_lock:
@@ -182,39 +441,53 @@ class InsteonBridge:
 
         async with self._discovery_lock:
             try:
-                devices_container = getattr(self._modem, "devices", None)
-                if devices_container is None:
-                    raise RuntimeError("pyinsteon modem has no devices container")
-                load_coro = getattr(devices_container, "async_load", None)
-                if callable(load_coro):
-                    await load_coro(refresh=refresh)
-                else:
-                    load_fn = getattr(devices_container, "load", None)
-                    if callable(load_fn):
-                        await asyncio.to_thread(load_fn, refresh=refresh)
-                device_iterable: Iterable[Any]
-                if hasattr(devices_container, "values"):
-                    device_iterable = devices_container.values()
-                else:
-                    device_iterable = list(devices_container)
-                snapshots = snapshot_collection(device_iterable)
-                async with self._device_cache_lock:
-                    self._device_cache = {item["id"]: item for item in snapshots}
-                    self._status["device_count"] = len(self._device_cache)
-                    self._status["last_discovery"] = time.time()
-                self._persist_device_cache()
-                await self._publish_event({"type": "discovery_complete", "device_count": len(snapshots)})
-                return {"devices": snapshots, "mode": "live", "count": len(snapshots)}
+                load_fn = getattr(manager, "async_load", None)
+                if callable(load_fn):
+                    kwargs: Dict[str, Any] = {}
+                    if refresh:
+                        kwargs = {"id_devices": 2, "load_modem_aldb": 2}
+                    await load_fn(**kwargs)
             except Exception as exc:
                 self.log.exception("Discovery failed: %s", exc)
                 raise
+            devices_iterable: Iterable[Any] = []
+            try:
+                values = getattr(manager, "values", None)
+                if callable(values):
+                    devices_iterable = list(values())
+            except Exception:
+                devices_iterable = []
+            snapshots: List[Dict[str, Any]] = []
+            for device in devices_iterable:
+                if self._modem and device is self._modem:
+                    continue
+                snapshot = await self._register_device(device, persist=False)
+                if snapshot:
+                    snapshots.append(snapshot)
+            async with self._device_cache_lock:
+                self._status["device_count"] = len(self._device_cache)
+                self._status["last_discovery"] = time.time()
+            self._persist_device_cache()
+            await self._publish_event({
+                "type": "discovery_complete",
+                "device_count": len(snapshots),
+                "devices": snapshots,
+                "mode": "live",
+            })
+            return {"devices": snapshots, "mode": "live", "count": len(snapshots)}
 
     async def list_devices(self) -> List[Dict[str, Any]]:
-        if self._modem:
+        manager = self._device_manager
+        if manager:
             try:
-                devices_container = getattr(self._modem, "devices", None)
-                if devices_container and hasattr(devices_container, "values"):
-                    return snapshot_collection(devices_container.values())
+                values = getattr(manager, "values", None)
+                if callable(values):
+                    snapshots: List[Dict[str, Any]] = []
+                    for device in list(values()):
+                        if self._modem and device is self._modem:
+                            continue
+                        snapshots.append(await self._update_cached_device(device, persist=False))
+                    return snapshots
             except Exception:
                 self.log.debug("Failed to snapshot live devices; falling back to cache", exc_info=True)
         async with self._device_cache_lock:
@@ -223,39 +496,22 @@ class InsteonBridge:
     async def get_device(self, device_id: str) -> Dict[str, Any]:
         if not device_id:
             raise DeviceNotFoundError("Device id required")
-        if self._modem:
-            try:
-                devices_container = getattr(self._modem, "devices", None)
-                if devices_container and hasattr(devices_container, "get"):
-                    device = devices_container.get(device_id)
-                    if device:
-                        return device_to_snapshot(device).to_dict()
-                for device in getattr(devices_container, "values", lambda: [])():
-                    snapshot = device_to_snapshot(device).to_dict()
-                    if snapshot["id"].lower() == device_id.lower():
-                        return snapshot
-            except Exception:
-                self.log.debug("Live device lookup failed; falling back to cache", exc_info=True)
+        normalized = self._normalize_device_id(device_id)
+        device = self._device_objects.get(normalized) or self._find_device_by_id(normalized)
+        if device:
+            return await self._update_cached_device(device, persist=False)
         async with self._device_cache_lock:
-            device = self._device_cache.get(device_id) or self._device_cache.get(device_id.lower())
-            if device:
-                return device
+            device_snapshot = self._device_cache.get(normalized)
+        if device_snapshot:
+            return device_snapshot
         raise DeviceNotFoundError(f"Insteon device {device_id} not found")
 
     # ------------------------------------------------------------------
     async def send_command(self, device_id: str, command: str, *, level: Optional[int] = None, fast: bool = False, duration: Optional[float] = None) -> Dict[str, Any]:
-        if not self._modem:
+        if not self._device_manager:
             raise BridgeNotConnected("Cannot send command without PLM connection")
-        devices_container = getattr(self._modem, "devices", None)
-        target_device = None
-        if devices_container and hasattr(devices_container, "get"):
-            target_device = devices_container.get(device_id)
-        if target_device is None and devices_container and hasattr(devices_container, "values"):
-            for device in devices_container.values():
-                snapshot = device_to_snapshot(device).to_dict()
-                if snapshot["id"].lower() == device_id.lower():
-                    target_device = device
-                    break
+        normalized = self._normalize_device_id(device_id)
+        target_device = self._device_objects.get(normalized) or self._find_device_by_id(normalized)
         if target_device is None:
             raise DeviceNotFoundError(f"Insteon device {device_id} not found")
 
@@ -291,11 +547,12 @@ class InsteonBridge:
 
         payload = {
             "type": "command_ack",
-            "device_id": device_id,
+            "device_id": normalized,
             "command": command,
             "level": original_level,
             "fast": fast,
         }
+        await self._update_cached_device(target_device, persist=False)
         await self._publish_event(payload)
         return payload
 
@@ -344,7 +601,16 @@ class InsteonBridge:
                     data = json.load(handle)
                 devices = data.get("devices") if isinstance(data, dict) else data
                 if isinstance(devices, list):
-                    self._device_cache = {d["id"]: d for d in devices if isinstance(d, dict) and "id" in d}
+                    normalized_cache: Dict[str, Dict[str, Any]] = {}
+                    for entry in devices:
+                        if not isinstance(entry, dict) or "id" not in entry:
+                            continue
+                        device_id = self._normalize_device_id(entry["id"])
+                        entry["id"] = device_id
+                        if "address" in entry:
+                            entry["address"] = self._normalize_device_id(entry["address"])
+                        normalized_cache[device_id] = entry
+                    self._device_cache = normalized_cache
                     self._status["device_count"] = len(self._device_cache)
                     self.log.info("Loaded %s cached Insteon devices from %s", len(self._device_cache), path)
         except Exception as exc:

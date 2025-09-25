@@ -10,11 +10,14 @@
 - Created `docs/insteon/requirements.md` documenting baseline assumptions, persistence decisions, and integration points.
 - Added `docs/insteon/device-schema.md` capturing the JSON structure shared between the bridge and HomeBrain server.
 - Scaffolded Python bridge package at `remote-device/insteon/` with connection lifecycle, REST/WebSocket endpoints, caching, and auth hooks; verified syntax via `python -m compileall`.
+- Implemented Node server integration (settings fields, disk persistence helpers, `/api/insteon/*` endpoints, and shared HTTP client).
+- Refactored the Python bridge to align with the latest `pyinsteon` `DeviceManager`, added real-time device/state subscriptions, normalized caching, and enriched discovery flows ready for hardware validation.
+- Added HomeBrain server background poller plus WebSocket ingestion with automatic reconnect/backoff, keeping the in-memory/device cache and persistence in sync with bridge events.
 
 ### Next Steps
-1. Exercise discovery/command flows against a live PLM to validate pyinsteon usage and enrich capability mapping.
-2. Implement Phase 2 server wiring (settings fields, persistence adapters, REST endpoints) targeting the new device schema.
-3. Backfill automated tests (unit + integration) and prepare Jetson deployment checklist for bridge rollout.
+1. Exercise discovery/command flows end-to-end against a live PLM to validate the revised bridge + server pipeline and capture pyinsteon quirks.
+2. Harden observability/tests: add integration smoke tests and logging around the poller/WebSocket handlers, then tune backoff thresholds with hardware in the loop.
+3. Draft the Jetson deployment checklist and UI wiring plan now that live device/event data is available to consume.
 
 ---
 
@@ -87,11 +90,11 @@ Transform the Python bridge into a full-featured PLM client exposing REST/WebSoc
 - Postman (or curl) examples for API usage.
 
 ### Status (2025-09-25)
-- Completed: Python bridge scaffolding added under `remote-device/insteon/` (config, device serialization, REST/WS endpoints, caching, auth).
+- Completed: Python bridge scaffolding added under `remote-device/insteon/` (config, device serialization, REST/WS endpoints, caching, auth) plus runtime event/state subscriptions aligned with `pyinsteon` 1.6.
 - Next Steps:
-  1. Implement discovery callbacks and real-time event push once connected to hardware.
-  2. Flesh out command mapping (scene support, extended commands) and add automated tests/examples.
-  3. Document service packaging/systemd updates in `docs/insteon/setup.md` after validation.
+  1. Validate discovery, subscription, and command flows against the physical PLM and adjust retry/backoff parameters as needed.
+  2. Broaden command mapping (scenes, sensors, extended payloads) informed by hardware testing and add targeted coverage/examples.
+  3. Draft deployment/runbook details (`docs/insteon/setup.md`) covering systemd, logging, and recovery once validation completes.
 
 ### Acceptance Criteria
 - curl http://localhost:8765/devices returns JSON array of discovered devices.
@@ -127,6 +130,13 @@ Extend HomeBrain Node server to consume bridge APIs and persist Insteon device m
 - Updated server routes & services.
 - Tests (unit/integration) mocking bridge responses.
 - Migration script to import existing demo devices (optional).
+
+### Status (2025-09-25)
+- Completed: core server wiring, persistence helpers, `/api/insteon/*` endpoints, plus background poller/WebSocket ingestion keeping the cache synchronized with bridge events.
+- Next Steps:
+    1. Exercise the poller/WebSocket runtime with live hardware, instrument latency/error reporting, and tune reconnect/backoff thresholds.
+    2. Add automated coverage for the new runtime helpers (mocked bridge/poller/WS flows) to guard regressions.
+    3. Coordinate with Phase 3 so the dashboard/settings can consume live status and surface bridge health/errors.
 
 ### Acceptance Criteria
 - POST /api/insteon/sync imports actual PLM device list.

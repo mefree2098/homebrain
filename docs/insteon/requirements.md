@@ -45,7 +45,7 @@
   - `POST /devices/{id}/command`
   - WebSocket `/ws` for async events (state updates, logs).
 - **HomeBrain Server**
-  - Add `/api/insteon/*` endpoints that proxy to the bridge, persist device data, and expose them to the UI.
+  - `/api/insteon/status`, `/api/insteon/sync`, `/api/insteon/devices`, and `/api/insteon/devices/:id/commands` endpoints proxy to the bridge, persist device data, and surface results to the UI.
   - Background sync worker pulling states at configurable interval `insteonPollInterval` (default 15 seconds) when WebSocket is unavailable.
 - **Client UI**
   - Settings page: bridge configuration, manual sync, port selection.
@@ -61,6 +61,6 @@
 
 ## Next Actions (Live Tracking)
 1. Build discovery/event pipeline in the Python bridge using live PLM data and persist results to the shared device schema.
-2. Extend the HomeBrain server with Insteon settings (`insteonEnabled`, `insteonBridgeUrl`, `insteonPollInterval`) and JSON persistence wiring.
+2. Layer background polling / event streaming plus automated tests onto the new server APIs once hardware connectivity is verified.
 3. Draft Jetson validation checklist covering service deployment, permissions, and end-to-end command smoke tests.
 

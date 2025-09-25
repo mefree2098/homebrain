@@ -15,6 +15,9 @@ const fsPromises = fs.promises;
 const { randomUUID } = require('crypto');
 require('dotenv').config();
 
+const { createInsteonClient, normalizeBaseUrl } = require('./utils/insteonClient');
+const WebSocket = require('ws');
+
 const SettingsModel = require('./models/Settings');
 let SecurityAlarmModel = null;
 let UserProfileModel = null;
@@ -184,6 +187,14 @@ const createMemoryStore = () => ({
       isOnline: true,
     },
   },
+  insteon: {
+    enabled: false,
+    bridgeStatus: null,
+    devices: [],
+    lastSync: null,
+    lastSyncSummary: null,
+    lastError: null,
+  },
   userProfiles: [],
   elevenLabs: { voices: [], lastFetched: 0 },
 });
@@ -196,7 +207,7 @@ const ELEVENLABS_CACHE_TTL_MS = Number(process.env.ELEVENLABS_CACHE_TTL_MS || 5 
 const LOGS_DIR = path.join(__dirname, 'logs');
 const CLIENT_LOG_FILE = path.join(LOGS_DIR, 'client-logs.ndjson');
 
-const DEFAULT_INSTEON_BRIDGE_URL = 'http://127.0.0.1:8765/status';
+const DEFAULT_INSTEON_BRIDGE_URL = 'http://127.0.0.1:8765';
 
 const ensureLogsDir = () => {
   if (!fs.existsSync(LOGS_DIR)) {
@@ -213,6 +224,10 @@ const DEFAULT_SETTINGS = {
   enableVoiceConfirmation: true,
   enableNotifications: true,
   insteonPort: '/dev/ttyUSB0',
+  insteonEnabled: false,
+  insteonBridgeUrl: 'http://127.0.0.1:8765',
+  insteonPollInterval: 15000,
+  insteonAuthToken: '',
   smartthingsToken: '',
   smartthingsClientId: '',
   smartthingsClientSecret: '',
@@ -246,6 +261,7 @@ const isMaskedPlaceholderValue = (value) => {
 const dataDir = path.join(__dirname, 'data');
 const settingsFilePath = path.join(dataDir, 'settings.json');
 const profilesFilePath = path.join(dataDir, 'user-profiles.json');
+const insteonDevicesFilePath = path.join(dataDir, 'insteon-devices.json');
 
 const ensureDataDir = () => {
   if (!fs.existsSync(dataDir)) {
@@ -292,7 +308,468 @@ const loadUserProfilesFromDisk = ({ log = true } = {}) => {
   }
 };
 
+const readInsteonDevicesFromDisk = () => {
+  try {
+    if (fs.existsSync(insteonDevicesFilePath)) {
+      const raw = fs.readFileSync(insteonDevicesFilePath, 'utf-8');
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return { devices: parsed, lastSync: null, lastSyncSummary: null };
+      }
+      if (parsed && typeof parsed === 'object') {
+        return {
+          devices: Array.isArray(parsed.devices) ? parsed.devices : [],
+          lastSync: parsed.lastSync || null,
+          lastSyncSummary: parsed.lastSyncSummary || null,
+        };
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to read Insteon devices from disk:', error.message);
+  }
+  return null;
+};
+
+const writeInsteonDevicesToDisk = (snapshot) => {
+  try {
+    ensureDataDir();
+    fs.writeFileSync(insteonDevicesFilePath, JSON.stringify(snapshot, null, 2), 'utf-8');
+  } catch (error) {
+    console.warn('Failed to write Insteon devices to disk:', error.message);
+  }
+};
+
+const applyInsteonDeviceSnapshot = (devices, { lastSync = null, summary = null, persist = true } = {}) => {
+  const normalized = Array.isArray(devices) ? devices.map((device) => deepClone(device)) : [];
+  memoryStore.insteon.devices = normalized;
+  memoryStore.insteon.lastSync = lastSync;
+  memoryStore.insteon.lastSyncSummary = summary;
+  if (persist) {
+    writeInsteonDevicesToDisk({ devices: normalized, lastSync, lastSyncSummary: summary });
+  }
+};
+
+const loadInsteonDevicesFromDisk = ({ log = true } = {}) => {
+  const persisted = readInsteonDevicesFromDisk();
+  if (persisted) {
+    applyInsteonDeviceSnapshot(persisted.devices || [], { lastSync: persisted.lastSync || null, summary: persisted.lastSyncSummary || null, persist: false });
+    if (log) {
+      console.log(`Loaded ${memoryStore.insteon.devices.length} Insteon device(s) from disk cache.`);
+    }
+  } else if (log) {
+    console.log('No persisted Insteon devices found on disk; starting fresh.');
+  }
+};
+
 loadUserProfilesFromDisk();
+loadInsteonDevicesFromDisk();
+
+const INSTEON_HTTP_TIMEOUT_MS = Number(process.env.INSTEON_HTTP_TIMEOUT_MS || 8000);
+const INSTEON_MIN_POLL_INTERVAL_MS = 1000;
+let cachedInsteonClient = null;
+
+function ensureInsteonEnabledFlag() {
+  memoryStore.insteon.enabled = !!(appSettings && appSettings.insteonEnabled);
+}
+
+function resolveInsteonBaseUrl() {
+  const candidate = (appSettings && appSettings.insteonBridgeUrl)
+    || process.env.INSTEON_BRIDGE_URL
+    || DEFAULT_INSTEON_BRIDGE_URL;
+  return normalizeBaseUrl(candidate);
+}
+
+function resolveInsteonAuthToken() {
+  const token = (appSettings && appSettings.insteonAuthToken) || process.env.INSTEON_AUTH_TOKEN || '';
+  const trimmed = String(token).trim();
+  return trimmed ? trimmed : null;
+}
+
+function getInsteonClient({ allowDisabled = false } = {}) {
+  if (!allowDisabled && !(appSettings && appSettings.insteonEnabled)) {
+    const error = new Error('Insteon integration is disabled');
+    error.status = 409;
+    throw error;
+  }
+  if (!cachedInsteonClient) {
+    cachedInsteonClient = createInsteonClient({
+      baseUrl: resolveInsteonBaseUrl(),
+      authToken: resolveInsteonAuthToken(),
+      timeoutMs: INSTEON_HTTP_TIMEOUT_MS,
+    });
+  }
+  return cachedInsteonClient;
+}
+
+function invalidateInsteonClient() {
+  cachedInsteonClient = null;
+}
+
+function getResolvedInsteonPollInterval() {
+  const value = Number(appSettings && appSettings.insteonPollInterval);
+  if (Number.isFinite(value) && value >= INSTEON_MIN_POLL_INTERVAL_MS) {
+    return value;
+  }
+  return DEFAULT_SETTINGS.insteonPollInterval;
+}
+
+function recordInsteonBridgeStatus(status) {
+  if (!status || typeof status !== 'object') {
+    memoryStore.insteon.bridgeStatus = null;
+    return null;
+  }
+  const snapshot = { ...status, fetchedAt: new Date().toISOString() };
+  memoryStore.insteon.bridgeStatus = snapshot;
+  return snapshot;
+}
+
+function recordInsteonError(error) {
+  const entry = {
+    message: error && error.message ? error.message : 'Unknown Insteon bridge error',
+    at: new Date().toISOString(),
+  };
+  if (error && error.status) {
+    entry.status = error.status;
+  }
+  if (error && error.details) {
+    entry.details = error.details;
+  }
+  memoryStore.insteon.lastError = entry;
+  return entry;
+}
+
+async function fetchInsteonBridgeStatus({ allowDisabled = false } = {}) {
+  const client = getInsteonClient({ allowDisabled });
+  const response = await client.status();
+  const snapshot = response && response.status ? response.status : response;
+  recordInsteonBridgeStatus(snapshot);
+  memoryStore.insteon.lastError = null;
+  return snapshot;
+}
+
+async function syncInsteonDevices({ refresh = true, includeDevices = false } = {}) {
+  const client = getInsteonClient();
+  const result = await client.discovery({ refresh });
+  const devices = Array.isArray(result && result.devices) ? result.devices : [];
+  const lastSync = new Date().toISOString();
+  const summary = { mode: result && result.mode ? result.mode : 'unknown', count: devices.length };
+  applyInsteonDeviceSnapshot(devices, { lastSync, summary });
+  memoryStore.insteon.lastError = null;
+  return {
+    ...summary,
+    lastSync,
+    devices: includeDevices ? devices : undefined,
+    raw: result,
+  };
+}
+
+const INSTEON_WS_MIN_BACKOFF_MS = 2000;
+const INSTEON_WS_MAX_BACKOFF_MS = 60000;
+let insteonPollEnabled = false;
+let insteonPollTimer = null;
+let insteonPollInFlight = false;
+let insteonWs = null;
+let insteonWsReconnectTimer = null;
+let insteonWsBackoffMs = INSTEON_WS_MIN_BACKOFF_MS;
+
+function normalizeDeviceId(value) {
+  return String(value || '').replace(/[^a-f0-9]/gi, '').toLowerCase();
+}
+
+function persistInsteonDevices() {
+  writeInsteonDevicesToDisk({
+    devices: memoryStore.insteon.devices,
+    lastSync: memoryStore.insteon.lastSync,
+    lastSyncSummary: memoryStore.insteon.lastSyncSummary,
+  });
+}
+
+function mergeInsteonDeviceSnapshot(device, { persist = false } = {}) {
+  if (!device || typeof device !== 'object') {
+    return;
+  }
+  const normalized = normalizeDeviceId(device.id || device.address);
+  if (!normalized) {
+    return;
+  }
+  const snapshot = deepClone(device);
+  snapshot.id = normalized;
+  const devices = memoryStore.insteon.devices;
+  const index = devices.findIndex((item) => normalizeDeviceId(item.id || item.address) === normalized);
+  if (index >= 0) {
+    devices[index] = { ...devices[index], ...snapshot };
+  } else {
+    devices.push(snapshot);
+  }
+  if (persist) {
+    memoryStore.insteon.lastSync = new Date().toISOString();
+    persistInsteonDevices();
+  }
+}
+
+function removeInsteonDeviceById(deviceId, { persist = false } = {}) {
+  const normalized = normalizeDeviceId(deviceId);
+  if (!normalized) {
+    return;
+  }
+  const beforeLength = memoryStore.insteon.devices.length;
+  memoryStore.insteon.devices = memoryStore.insteon.devices.filter((item) => normalizeDeviceId(item.id || item.address) !== normalized);
+  if (persist && memoryStore.insteon.devices.length !== beforeLength) {
+    memoryStore.insteon.lastSync = new Date().toISOString();
+    persistInsteonDevices();
+  }
+}
+
+function clearInsteonPollTimer() {
+  if (insteonPollTimer) {
+    clearTimeout(insteonPollTimer);
+    insteonPollTimer = null;
+  }
+}
+
+function scheduleInsteonPoll(delayMs) {
+  clearInsteonPollTimer();
+  insteonPollTimer = setTimeout(() => {
+    insteonPollTimer = null;
+    runInsteonPoll().catch((error) => {
+      console.warn('Insteon poll failed:', error?.message || error);
+    });
+  }, Math.max(delayMs, INSTEON_MIN_POLL_INTERVAL_MS));
+}
+
+async function runInsteonPoll() {
+  if (!insteonPollEnabled || insteonPollInFlight) {
+    return;
+  }
+  insteonPollInFlight = true;
+  try {
+    await ensureSettingsLoaded();
+    if (!appSettings.insteonEnabled) {
+      return;
+    }
+    await fetchInsteonBridgeStatus({ allowDisabled: true });
+
+    const pollInterval = getResolvedInsteonPollInterval();
+    const lastSyncIso = memoryStore.insteon.lastSync;
+    const lastSyncMs = lastSyncIso ? Date.parse(lastSyncIso) : 0;
+    const staleThreshold = Math.max(pollInterval * 2, 60_000);
+    const needsSync = !memoryStore.insteon.devices.length || !lastSyncMs || (Date.now() - lastSyncMs) > staleThreshold;
+
+    if (needsSync) {
+      try {
+        await syncInsteonDevices({ refresh: false, includeDevices: false });
+      } catch (syncError) {
+        recordInsteonError(syncError);
+      }
+    }
+  } catch (error) {
+    recordInsteonError(error);
+  } finally {
+    insteonPollInFlight = false;
+    if (insteonPollEnabled) {
+      scheduleInsteonPoll(getResolvedInsteonPollInterval());
+    }
+  }
+}
+
+function stopInsteonPoller() {
+  insteonPollEnabled = false;
+  clearInsteonPollTimer();
+}
+
+function startInsteonPoller({ immediate = true } = {}) {
+  stopInsteonPoller();
+  insteonPollEnabled = true;
+  if (immediate) {
+    runInsteonPoll().catch((error) => {
+      console.warn('Initial Insteon poll failed:', error?.message || error);
+    });
+  } else {
+    scheduleInsteonPoll(getResolvedInsteonPollInterval());
+  }
+}
+
+function clearInsteonWsReconnect() {
+  if (insteonWsReconnectTimer) {
+    clearTimeout(insteonWsReconnectTimer);
+    insteonWsReconnectTimer = null;
+  }
+}
+
+function scheduleInsteonWsReconnect() {
+  if (!appSettings?.insteonEnabled || insteonWsReconnectTimer) {
+    return;
+  }
+  const delay = insteonWsBackoffMs;
+  insteonWsBackoffMs = Math.min(INSTEON_WS_MAX_BACKOFF_MS, Math.max(INSTEON_WS_MIN_BACKOFF_MS, insteonWsBackoffMs * 2));
+  insteonWsReconnectTimer = setTimeout(() => {
+    insteonWsReconnectTimer = null;
+    connectInsteonWebSocket();
+  }, delay);
+}
+
+function closeInsteonWebSocket({ scheduleReconnect = false } = {}) {
+  clearInsteonWsReconnect();
+  if (insteonWs) {
+    try {
+      insteonWs.removeAllListeners();
+      insteonWs.close();
+    } catch (error) {
+      console.warn('Error closing Insteon WebSocket:', error.message);
+    }
+    insteonWs = null;
+  }
+  if (scheduleReconnect) {
+    scheduleInsteonWsReconnect();
+  } else {
+    insteonWsBackoffMs = INSTEON_WS_MIN_BACKOFF_MS;
+  }
+}
+
+function handleInsteonEvent(event) {
+  if (!event || typeof event !== 'object') {
+    return;
+  }
+
+  switch (event.type) {
+    case 'bridge_status':
+      recordInsteonBridgeStatus(event);
+      memoryStore.insteon.lastError = null;
+      break;
+    case 'device_snapshot':
+    case 'discovery_complete': {
+      if (Array.isArray(event.devices)) {
+        const summary = {
+          source: 'ws',
+          mode: event.mode || 'ws',
+          count: event.devices.length,
+        };
+        applyInsteonDeviceSnapshot(event.devices, { lastSync: new Date().toISOString(), summary, persist: true });
+        memoryStore.insteon.lastError = null;
+      }
+      break;
+    }
+    case 'device_added':
+      if (event.device) {
+        mergeInsteonDeviceSnapshot(event.device, { persist: true });
+        memoryStore.insteon.lastError = null;
+      }
+      break;
+    case 'device_removed':
+      if (event.device_id) {
+        removeInsteonDeviceById(event.device_id, { persist: true });
+        memoryStore.insteon.lastError = null;
+      }
+      break;
+    case 'device_event':
+    case 'device_state':
+      if (event.device) {
+        mergeInsteonDeviceSnapshot(event.device, { persist: false });
+        memoryStore.insteon.lastError = null;
+      }
+      break;
+    case 'command_ack':
+      memoryStore.insteon.lastError = null;
+      break;
+    default:
+      break;
+  }
+}
+
+function connectInsteonWebSocket() {
+  if (!appSettings?.insteonEnabled) {
+    return;
+  }
+  closeInsteonWebSocket({ scheduleReconnect: false });
+
+  let wsUrl;
+  try {
+    const baseUrl = resolveInsteonBaseUrl();
+    const url = new URL(baseUrl);
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/ws`;
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl = url.toString();
+  } catch (error) {
+    console.warn('Invalid Insteon bridge URL for WebSocket connection:', error.message);
+    return;
+  }
+
+  const headers = {};
+  const token = resolveInsteonAuthToken();
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+
+  insteonWs = new WebSocket(wsUrl, { headers });
+  insteonWsBackoffMs = INSTEON_WS_MIN_BACKOFF_MS;
+
+  insteonWs.on('open', () => {
+    console.log('Connected to Insteon bridge WebSocket.');
+    memoryStore.insteon.lastError = null;
+  });
+
+  insteonWs.on('message', (data) => {
+    try {
+      const payload = typeof data === 'string' ? data : data.toString('utf-8');
+      if (!payload) {
+        return;
+      }
+      const event = JSON.parse(payload);
+      handleInsteonEvent(event);
+    } catch (error) {
+      console.warn('Failed to process Insteon WebSocket payload:', error.message);
+    }
+  });
+
+  insteonWs.on('close', (code) => {
+    console.warn(`Insteon bridge WebSocket closed (code ${code}).`);
+    insteonWs = null;
+    if (appSettings?.insteonEnabled) {
+      scheduleInsteonWsReconnect();
+    }
+  });
+
+  insteonWs.on('error', (error) => {
+    console.warn('Insteon bridge WebSocket error:', error.message);
+  });
+}
+
+async function stopInsteonRuntime() {
+  stopInsteonPoller();
+  closeInsteonWebSocket({ scheduleReconnect: false });
+}
+
+async function refreshInsteonRuntime({ reason } = {}) {
+  await ensureSettingsLoaded();
+  ensureInsteonEnabledFlag();
+  invalidateInsteonClient();
+
+  if (!appSettings.insteonEnabled) {
+    await stopInsteonRuntime();
+    memoryStore.insteon.bridgeStatus = null;
+    return false;
+  }
+
+  startInsteonPoller({ immediate: true });
+  connectInsteonWebSocket();
+  return true;
+}
+
+function getInsteonDeviceById(deviceId) {
+  if (!deviceId) {
+    return null;
+  }
+  const target = String(deviceId).toLowerCase();
+  return memoryStore.insteon.devices.find((device) => {
+    const id = String(device.id || device.address || device._id || '').toLowerCase();
+    return id === target;
+  }) || null;
+}
+
+ensureInsteonEnabledFlag();
 
 const getMemoryStoreCounts = () => ({
   devices: memoryStore.devices.length,
@@ -304,8 +781,7 @@ const getMemoryStoreCounts = () => ({
   securityAlarms: memoryStore.security?.alarm ? 1 : 0,
   smartthingsDevices: memoryStore.smartthings?.devices?.length || 0,
   smartthingsScenes: memoryStore.smartthings?.scenes?.length || 0,
-  insteonDevices: memoryStore.devices.filter((device) => (device.protocol || device.source || '').toLowerCase() === 'insteon'
-    || String(device._id || device.id || '').toLowerCase().startsWith('insteon-')).length,
+  insteonDevices: memoryStore.insteon?.devices?.length || 0,
 });
 
 const resetMemoryStore = ({ includeSamples = true, loadProfiles = true } = {}) => {
@@ -339,6 +815,7 @@ const resetMemoryStore = ({ includeSamples = true, loadProfiles = true } = {}) =
   }
 
   memoryStore = newStore;
+  loadInsteonDevicesFromDisk({ log: false });
   if (loadProfiles) {
     loadUserProfilesFromDisk({ log: false });
   } else {
@@ -402,6 +879,8 @@ async function ensureSettingsLoaded() {
   settingsLoadPromise = (async () => {
     const persisted = await readSettingsPersisted();
     appSettings = { ...DEFAULT_SETTINGS, ...persisted };
+    ensureInsteonEnabledFlag();
+    invalidateInsteonClient();
     settingsLoaded = true;
     return appSettings;
   })();
@@ -421,6 +900,7 @@ const maskSensitiveSettings = (settings) => {
     'smartthingsClientSecret',
     'openaiApiKey',
     'anthropicApiKey',
+    'insteonAuthToken',
   ];
 
   sensitiveKeys.forEach((key) => {
@@ -864,6 +1344,7 @@ const SENSITIVE_KEYS = new Set([
   'smartthingsClientSecret',
   'openaiApiKey',
   'anthropicApiKey',
+  'insteonAuthToken',
 ]);
 
 function stripSensitivePlaceholders(partialSettings, currentSettings) {
@@ -894,6 +1375,9 @@ app.put('/api/settings', asyncHandler(async (req, res) => {
   const merged = stripSensitivePlaceholders(updates, appSettings);
   const saved = await writeSettingsPersisted(merged);
   appSettings = { ...DEFAULT_SETTINGS, ...saved };
+  ensureInsteonEnabledFlag();
+  invalidateInsteonClient();
+  await refreshInsteonRuntime({ reason: 'settings_updated' });
   return sendSuccess(res, { message: 'Settings updated', settings: maskSensitiveSettings(appSettings) });
 }));
 
@@ -930,6 +1414,113 @@ app.post('/api/settings/test-elevenlabs', asyncHandler(async (req, res) => {
     return sendError(res, status, message, error.details);
   }
 }));
+app.get('/api/insteon/status', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
+  const enabled = !!appSettings.insteonEnabled;
+  const refreshStatus = req.query.refresh === 'true';
+  if (!enabled) {
+    const snapshot = memoryStore.insteon.bridgeStatus || null;
+    return sendSuccess(res, {
+      enabled: false,
+      bridgeUrl: resolveInsteonBaseUrl(),
+      port: appSettings.insteonPort,
+      bridgeStatus: snapshot,
+      deviceCount: memoryStore.insteon.devices.length,
+      lastSync: memoryStore.insteon.lastSync,
+      pollInterval: getResolvedInsteonPollInterval(),
+      lastError: memoryStore.insteon.lastError,
+    });
+  }
+
+  try {
+    if (!memoryStore.insteon.bridgeStatus || refreshStatus) {
+      await fetchInsteonBridgeStatus();
+    }
+    return sendSuccess(res, {
+      enabled: true,
+      bridgeUrl: resolveInsteonBaseUrl(),
+      port: appSettings.insteonPort,
+      bridgeStatus: memoryStore.insteon.bridgeStatus,
+      deviceCount: memoryStore.insteon.devices.length,
+      lastSync: memoryStore.insteon.lastSync,
+      pollInterval: getResolvedInsteonPollInterval(),
+      lastError: memoryStore.insteon.lastError,
+    });
+  } catch (error) {
+    const statusCode = error.status ?? 502;
+    const details = recordInsteonError(error);
+    return sendError(res, statusCode, error.message || 'Failed to query Insteon bridge', details);
+  }
+}));
+
+app.get('/api/insteon/devices', asyncHandler(async (_req, res) => {
+  await ensureSettingsLoaded();
+  return sendSuccess(res, {
+    enabled: !!appSettings.insteonEnabled,
+    devices: deepClone(memoryStore.insteon.devices),
+    count: memoryStore.insteon.devices.length,
+    lastSync: memoryStore.insteon.lastSync,
+    pollInterval: getResolvedInsteonPollInterval(),
+  });
+}));
+
+app.get('/api/insteon/devices/:id', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
+  const device = getInsteonDeviceById(req.params.id);
+  if (!device) {
+    return sendError(res, 404, 'Insteon device not found');
+  }
+  return sendSuccess(res, { device: deepClone(device) });
+}));
+
+app.post('/api/insteon/sync', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
+  if (!appSettings.insteonEnabled) {
+    return sendError(res, 409, 'Insteon integration is disabled');
+  }
+  try {
+    const body = req.body || {};
+    const refresh = body.refresh === false ? false : true;
+    const summary = await syncInsteonDevices({ refresh, includeDevices: true });
+    return sendSuccess(res, {
+      message: 'Insteon discovery completed',
+      deviceCount: summary.count,
+      lastSync: summary.lastSync,
+      mode: summary.mode,
+      devices: summary.devices || [],
+    });
+  } catch (error) {
+    const statusCode = error.status ?? 502;
+    const details = recordInsteonError(error);
+    return sendError(res, statusCode, error.message || 'Failed to sync Insteon devices', details);
+  }
+}));
+
+app.post('/api/insteon/devices/:id/commands', asyncHandler(async (req, res) => {
+  await ensureSettingsLoaded();
+  if (!appSettings.insteonEnabled) {
+    return sendError(res, 409, 'Insteon integration is disabled');
+  }
+  const deviceId = req.params.id;
+  const payload = req.body || {};
+  const command = payload.command;
+  if (!command || typeof command !== 'string') {
+    return sendError(res, 400, 'command is required');
+  }
+  try {
+    const client = getInsteonClient();
+    const commandPayload = { command, level: payload.level, fast: payload.fast, duration: payload.duration };
+    const result = await client.sendCommand(deviceId, commandPayload);
+    memoryStore.insteon.lastError = null;
+    return sendSuccess(res, { message: 'Command dispatched', result });
+  } catch (error) {
+    const statusCode = error.status ?? 502;
+    const details = recordInsteonError(error);
+    return sendError(res, statusCode, error.message || 'Failed to send Insteon command', details);
+  }
+}));
+
+
 
 app.post('/api/settings/test-openai', asyncHandler(async (req, res) => {
   const { apiKey, model } = req.body || {};
@@ -1194,6 +1785,9 @@ app.delete('/api/maintenance/devices/insteon', asyncHandler(async (_req, res) =>
     return marker !== 'insteon' && !id.startsWith('insteon-');
   };
   memoryStore.devices = memoryStore.devices.filter(filterFn);
+  applyInsteonDeviceSnapshot([], { lastSync: null, summary: null });
+  memoryStore.insteon.lastError = null;
+  memoryStore.insteon.bridgeStatus = null;
   const after = getMemoryStoreCounts();
   const deletedCount = Math.max(0, (before.insteonDevices || 0) - (after.insteonDevices || 0));
   return sendSuccess(res, {
@@ -1229,93 +1823,43 @@ app.post('/api/maintenance/fake-data', asyncHandler(async (_req, res) => {
   });
 }));
 
-app.post('/api/maintenance/sync/insteon', asyncHandler(async (_req, res) => {
+app.post('/api/maintenance/sync/insteon', asyncHandler(async (req, res) => {
   await ensureSettingsLoaded();
-  if (!appSettings.insteonPort) {
-    return sendError(res, 400, 'Insteon PLM port not configured in settings');
+  if (!appSettings.insteonEnabled) {
+    return sendError(res, 409, 'Insteon integration is disabled');
   }
-
-  return sendSuccess(res, {
-    message: 'Insteon sync dispatched (demo mode)',
-    deviceCount: 0,
-    note: 'Real Insteon discovery requires the Python PLM bridge service to be running on the Jetson.',
-  });
+  try {
+    const body = req.body || {};
+    const refresh = body.refresh === false ? false : true;
+    const summary = await syncInsteonDevices({ refresh, includeDevices: false });
+    return sendSuccess(res, {
+      message: 'Insteon discovery completed',
+      deviceCount: summary.count,
+      lastSync: summary.lastSync,
+      mode: summary.mode,
+    });
+  } catch (error) {
+    const status = error.status ?? 502;
+    const details = recordInsteonError(error);
+    return sendError(res, status, error.message || 'Failed to sync Insteon devices', details);
+  }
 }));
 
 app.post('/api/maintenance/test-insteon', asyncHandler(async (_req, res) => {
   await ensureSettingsLoaded();
-  const port = appSettings.insteonPort;
-  if (!port) {
-    return sendError(res, 400, 'Insteon PLM port not configured in settings');
-  }
-
-  const bridgeCandidates = [
-    appSettings.insteonBridgeUrl,
-    process.env.INSTEON_BRIDGE_URL,
-    DEFAULT_INSTEON_BRIDGE_URL,
-  ];
-
-  const bridgeErrors = [];
-  const tested = new Set();
-
-  for (const candidate of bridgeCandidates) {
-    const url = (candidate || '').trim();
-    if (!url || tested.has(url)) continue;
-    tested.add(url);
-    try {
-      const response = await fetchWithFallback(url, { method: 'GET', headers: { Accept: 'application/json' } });
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText || ''}`.trim());
-      }
-      const textPayload = await response.text();
-      let payload = null;
-      if (textPayload) {
-        try {
-          payload = JSON.parse(textPayload);
-        } catch {
-          payload = { raw: textPayload };
-        }
-      }
-      const message = payload?.message || `Bridge responded from ${url}`;
-      return sendSuccess(res, {
-        message,
-        port,
-        bridge: { url, payload },
-      });
-    } catch (error) {
-      bridgeErrors.push({ url, message: error.message });
-    }
-  }
-
   try {
-    await fsPromises.access(port, fs.constants.R_OK | fs.constants.W_OK);
-    let fd;
-    try {
-      fd = fs.openSync(port, fs.constants.O_RDWR);
-    } finally {
-      if (typeof fd === 'number') {
-        fs.closeSync(fd);
-      }
-    }
-
+    const status = await fetchInsteonBridgeStatus({ allowDisabled: true });
     return sendSuccess(res, {
-      message: `Successfully opened PLM port ${port}`,
-      port,
-      bridge: bridgeErrors.length ? { errors: bridgeErrors } : undefined,
+      message: 'Insteon bridge reachable',
+      enabled: !!appSettings.insteonEnabled,
+      bridgeUrl: resolveInsteonBaseUrl(),
+      port: appSettings.insteonPort,
+      status,
     });
   } catch (error) {
-    const status = ['ENOENT', 'ENOTDIR'].includes(error.code) ? 404
-      : (error.code === 'EACCES' ? 403 : 500);
-    let message = error.code === 'ENOENT'
-      ? `PLM device not found at ${port}`
-      : (error.code === 'EACCES'
-        ? `Permission denied reading ${port}. Ensure the service has access to the serial device or run the bridge service under a user with access.`
-        : error.message);
-    if (bridgeErrors.length) {
-      const notes = bridgeErrors.map((error) => `${error.url}: ${error.message}`).join('; ');
-      message += ` (Bridge attempts: ${notes})`;
-    }
-    return sendError(res, status, message, { code: error.code, port, bridgeErrors });
+    const statusCode = error.status ?? 502;
+    const details = recordInsteonError(error);
+    return sendError(res, statusCode, error.message || 'Failed to reach Insteon bridge', details);
   }
 }));
 
@@ -2341,6 +2885,8 @@ const SETTINGS_DB_OPTIONS = { serverSelectionTimeoutMS: SETTINGS_DB_TIMEOUT_MS }
 
 
 async function startServer() {
+  await ensureSettingsLoaded();
+  await refreshInsteonRuntime({ reason: 'startup' });
   if (SETTINGS_DB_URI) {
     if (mongoose.connection.readyState === 0) {
       try {
@@ -2368,6 +2914,7 @@ startServer().catch((error) => {
 
 async function gracefulShutdown(signal) {
   console.log(`HomeBrain server received ${signal}; shutting down...`);
+  await stopInsteonRuntime();
   try {
     writeUserProfilesToDisk(memoryStore.userProfiles);
   } catch (error) {
