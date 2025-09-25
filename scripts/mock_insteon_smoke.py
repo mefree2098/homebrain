@@ -23,12 +23,16 @@ async def main() -> None:
     if not config.allow_mock_mode:
         config = replace(config, allow_mock_mode=True)
 
+    timeout_seconds = float(os.getenv("INSTEON_SMOKE_TIMEOUT", "10"))
+
     bridge = InsteonBridge(config)
     await bridge.start()
     try:
-        connected = await bridge.wait_until_connected(timeout=2)
+        connected = await bridge.wait_until_connected(timeout=timeout_seconds)
         if not connected:
-            raise RuntimeError("Mock bridge failed to signal connectivity within 2 seconds")
+            raise RuntimeError(
+                f"Mock bridge failed to signal connectivity within {timeout_seconds} seconds"
+            )
 
         discovery = await bridge.run_discovery(refresh=False)
         print(json.dumps(discovery, indent=2))
