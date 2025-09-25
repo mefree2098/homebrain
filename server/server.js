@@ -196,6 +196,8 @@ const ELEVENLABS_CACHE_TTL_MS = Number(process.env.ELEVENLABS_CACHE_TTL_MS || 5 
 const LOGS_DIR = path.join(__dirname, 'logs');
 const CLIENT_LOG_FILE = path.join(LOGS_DIR, 'client-logs.ndjson');
 
+const DEFAULT_INSTEON_BRIDGE_URL = 'http://127.0.0.1:8765/status';
+
 const ensureLogsDir = () => {
   if (!fs.existsSync(LOGS_DIR)) {
     fs.mkdirSync(LOGS_DIR, { recursive: true });
@@ -1247,6 +1249,44 @@ app.post('/api/maintenance/test-insteon', asyncHandler(async (_req, res) => {
     return sendError(res, 400, 'Insteon PLM port not configured in settings');
   }
 
+  const bridgeCandidates = [
+    appSettings.insteonBridgeUrl,
+    process.env.INSTEON_BRIDGE_URL,
+    DEFAULT_INSTEON_BRIDGE_URL,
+  ];
+
+  const bridgeErrors = [];
+  const tested = new Set();
+
+  for (const candidate of bridgeCandidates) {
+    const url = (candidate || '').trim();
+    if (!url || tested.has(url)) continue;
+    tested.add(url);
+    try {
+      const response = await fetchWithFallback(url, { method: 'GET', headers: { Accept: 'application/json' } });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText || ''}`.trim());
+      }
+      const textPayload = await response.text();
+      let payload = null;
+      if (textPayload) {
+        try {
+          payload = JSON.parse(textPayload);
+        } catch {
+          payload = { raw: textPayload };
+        }
+      }
+      const message = payload?.message || `Bridge responded from ${url}`;
+      return sendSuccess(res, {
+        message,
+        port,
+        bridge: { url, payload },
+      });
+    } catch (error) {
+      bridgeErrors.push({ url, message: error.message });
+    }
+  }
+
   try {
     await fsPromises.access(port, fs.constants.R_OK | fs.constants.W_OK);
     let fd;
@@ -1261,16 +1301,21 @@ app.post('/api/maintenance/test-insteon', asyncHandler(async (_req, res) => {
     return sendSuccess(res, {
       message: `Successfully opened PLM port ${port}`,
       port,
+      bridge: bridgeErrors.length ? { errors: bridgeErrors } : undefined,
     });
   } catch (error) {
     const status = ['ENOENT', 'ENOTDIR'].includes(error.code) ? 404
       : (error.code === 'EACCES' ? 403 : 500);
-    const message = error.code === 'ENOENT'
+    let message = error.code === 'ENOENT'
       ? `PLM device not found at ${port}`
       : (error.code === 'EACCES'
-        ? `Permission denied reading ${port}. Ensure the service has access to the serial device.`
+        ? `Permission denied reading ${port}. Ensure the service has access to the serial device or run the bridge service under a user with access.`
         : error.message);
-    return sendError(res, status, message, { code: error.code });
+    if (bridgeErrors.length) {
+      const notes = bridgeErrors.map((error) => `${error.url}: ${error.message}`).join('; ');
+      message += ` (Bridge attempts: ${notes})`;
+    }
+    return sendError(res, status, message, { code: error.code, port, bridgeErrors });
   }
 }));
 
