@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 import os
@@ -27,6 +27,8 @@ class BridgeConfig:
     discovery_refresh_default: bool
     device_cache_path: Path
     allow_mock_mode: bool
+    mock_fallback_on_failure: bool
+    mock_device_cycle_seconds: float
     auth_token: Optional[str]
     websocket_event_buffer: int
     log_level: str
@@ -42,6 +44,8 @@ class BridgeConfig:
         discovery_refresh_default = _env_bool("INSTEON_DISCOVERY_REFRESH", True)
         device_cache_path = Path(os.getenv("INSTEON_DEVICE_CACHE", "/opt/homebrain/insteon/devices.json"))
         allow_mock_mode = _env_bool("INSTEON_ALLOW_MOCK", False)
+        mock_fallback_on_failure = _env_bool("INSTEON_MOCK_FALLBACK", True)
+        mock_device_cycle_seconds = float(os.getenv("INSTEON_MOCK_DEVICE_CYCLE_SECONDS", "15"))
         auth_token = os.getenv("INSTEON_AUTH_TOKEN") or None
         websocket_event_buffer = int(os.getenv("INSTEON_WS_EVENT_BUFFER", "1000"))
         log_level = os.getenv("INSTEON_LOG_LEVEL", "INFO")
@@ -56,10 +60,12 @@ class BridgeConfig:
             discovery_refresh_default=discovery_refresh_default,
             device_cache_path=device_cache_path,
             allow_mock_mode=allow_mock_mode,
+            mock_fallback_on_failure=mock_fallback_on_failure,
+            mock_device_cycle_seconds=mock_device_cycle_seconds,
             auth_token=auth_token,
             websocket_event_buffer=websocket_event_buffer,
             log_level=log_level,
         )
 
 
-__all__ = ["BridgeConfig", "_env_bool"]
+__all__ = ["BridgeConfig", "_env_bool", "replace"]

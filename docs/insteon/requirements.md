@@ -59,8 +59,9 @@
 - Decide on authentication scheme for bridge API if remote UI ever bypasses the Node server.
 - Gather mapping between Insteon categories/subcategories and HomeBrain device templates.
 
-## Next Actions (Live Tracking)
+
 1. Build discovery/event pipeline in the Python bridge using live PLM data and persist results to the shared device schema.
 2. Layer background polling / event streaming plus automated tests onto the new server APIs once hardware connectivity is verified.
 3. Draft Jetson validation checklist covering service deployment, permissions, and end-to-end command smoke tests.
 
+\

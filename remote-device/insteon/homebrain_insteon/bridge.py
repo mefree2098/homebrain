@@ -7,16 +7,22 @@ import json
 import logging
 import time
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from types import SimpleNamespace
 
 try:  # pyinsteon is optional for documentation builds
     from pyinsteon import async_connect
     from pyinsteon.constants import DeviceAction
 except Exception:  # pragma: no cover - library missing in dev env
     async_connect = None  # type: ignore
-    DeviceAction = None  # type: ignore
+
+    class DeviceAction(str, Enum):  # type: ignore
+        ADDED = "added"
+        REMOVED = "removed"
+        COMPLETED = "completed"
 
 from .config import BridgeConfig
 from .devices import device_to_snapshot
@@ -59,6 +65,7 @@ class InsteonBridge:
             "last_error": None,
             "device_count": 0,
             "last_discovery": None,
+            "mock_mode": False,
         }
 
         self._device_cache: Dict[str, Dict[str, Any]] = {}
@@ -69,6 +76,7 @@ class InsteonBridge:
         self._ws_clients: List[Any] = []  # WebSocketResponse objects
 
         self._load_cached_devices()
+        self._using_mock = False
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -104,8 +112,13 @@ class InsteonBridge:
     # ------------------------------------------------------------------
     async def _connect_loop(self) -> None:
         if async_connect is None:
-            self.log.warning("pyinsteon not installed; running in offline mode")
-            await self._publish_event({"type": "bridge_status", "connected": False, "note": "pyinsteon missing"})
+            if self.config.allow_mock_mode:
+                self.log.info("pyinsteon not installed; starting mock Insteon runtime")
+                await self._start_mock_runtime()
+                await self._stop_event.wait()
+            else:
+                self.log.warning("pyinsteon not installed; running in offline mode")
+                await self._publish_event({"type": "bridge_status", "connected": False, "note": "pyinsteon missing"})
             return
 
         base_backoff = self.config.reconnect_initial
@@ -125,6 +138,12 @@ class InsteonBridge:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self.config.allow_mock_mode and self.config.mock_fallback_on_failure:
+                    self.log.warning("PLM connect failed (%s); falling back to mock runtime", exc)
+                    await self._start_mock_runtime()
+                    await self._stop_event.wait()
+                    sleep_delay = 0.0
+                    continue
                 self._status["connected"] = False
                 self._connected_event.clear()
                 self._status["last_error"] = f"{type(exc).__name__}: {exc}"
@@ -154,6 +173,17 @@ class InsteonBridge:
             return
 
     # ------------------------------------------------------------------
+    async def _start_mock_runtime(self) -> None:
+        if not self.config.allow_mock_mode:
+            raise BridgeNotConnected("Mock mode is disabled")
+        manager = MockDeviceManager(self.loop, cycle_seconds=self.config.mock_device_cycle_seconds)
+        self._using_mock = True
+        await self._on_connected(manager)
+        starter = getattr(manager, "start_runtime", None) or getattr(manager, "start", None)
+        if callable(starter):
+            starter()
+
+    # ------------------------------------------------------------------
     async def _on_connected(self, manager: Any) -> None:
         self._device_manager = manager
         self._modem = getattr(manager, "modem", None)
@@ -161,6 +191,7 @@ class InsteonBridge:
         self._status["successful_connects"] += 1
         self._status["last_error"] = None
         self._connected_event.set()
+        self._status["mock_mode"] = bool(self._using_mock)
 
         if hasattr(manager, "subscribe"):
             self._manager_subscription = self._handle_device_manager_event
@@ -173,6 +204,7 @@ class InsteonBridge:
             "type": "bridge_status",
             "connected": True,
             "port": self.config.serial_port,
+            "mock_mode": bool(self._using_mock),
         })
 
         await self._prime_device_cache(manager)
@@ -195,6 +227,7 @@ class InsteonBridge:
         self._modem = None
         self._connected_event.clear()
         self._status["connected"] = False
+        self._status["mock_mode"] = False
 
         if manager and hasattr(manager, "async_close"):
             with suppress(Exception):
@@ -203,11 +236,14 @@ class InsteonBridge:
             with suppress(Exception):
                 await asyncio.wait_for(modem.async_close(), timeout=5)
 
+        self._using_mock = False
+
         if was_connected:
             await self._publish_event({
                 "type": "bridge_status",
                 "connected": False,
                 "port": self.config.serial_port,
+                "mock_mode": False,
             })
 
     async def _prime_device_cache(self, manager: Any) -> None:
@@ -236,6 +272,7 @@ class InsteonBridge:
                 "type": "device_snapshot",
                 "count": len(snapshots),
                 "devices": snapshots,
+                "mode": "mock" if self._using_mock else "live",
             })
         self.log.info("Connected to PLM; known devices: %s", len(snapshots))
 
@@ -345,16 +382,20 @@ class InsteonBridge:
         return handler
 
     def _handle_device_manager_event(self, **payload: Any) -> None:
-        if DeviceAction is None:
-            return
         action = payload.get("action")
         address = payload.get("address")
         if not address:
             return
         normalized = self._normalize_device_id(address)
-        if action == DeviceAction.ADDED:
+        action_name = getattr(action, "name", None)
+        if not action_name and isinstance(action, str):
+            action_name = action.upper()
+        elif not action_name:
+            action_name = str(action).upper()
+
+        if action_name == DeviceAction.ADDED.name:
             self.loop.create_task(self._handle_device_added(normalized))
-        elif action == DeviceAction.REMOVED:
+        elif action_name == DeviceAction.REMOVED.name:
             self.loop.create_task(self._handle_device_removed(normalized))
 
     async def _handle_device_added(self, device_id: str) -> None:
@@ -436,7 +477,7 @@ class InsteonBridge:
                 self.log.info("Discovery requested in mock mode; returning cached devices only")
                 async with self._device_cache_lock:
                     devices = list(self._device_cache.values())
-                return {"devices": devices, "mode": "mock"}
+                return {"devices": devices, "mode": "mock", "count": len(devices)}
             raise BridgeNotConnected("PLM not connected")
 
         async with self._discovery_lock:
@@ -468,13 +509,14 @@ class InsteonBridge:
                 self._status["device_count"] = len(self._device_cache)
                 self._status["last_discovery"] = time.time()
             self._persist_device_cache()
+            mode = "mock" if self._using_mock else "live"
             await self._publish_event({
                 "type": "discovery_complete",
                 "device_count": len(snapshots),
                 "devices": snapshots,
-                "mode": "live",
+                "mode": mode,
             })
-            return {"devices": snapshots, "mode": "live", "count": len(snapshots)}
+            return {"devices": snapshots, "mode": mode, "count": len(snapshots)}
 
     async def list_devices(self) -> List[Dict[str, Any]]:
         manager = self._device_manager
@@ -585,6 +627,9 @@ class InsteonBridge:
         status = dict(self._status)
         status["connected"] = bool(self._connected_event.is_set())
         status["ws_clients"] = len(self._ws_clients)
+        status["mock_mode"] = bool(status.get("mock_mode"))
+        if status["mock_mode"]:
+            status.setdefault("mode", "mock")
         last_disc = status.get("last_discovery")
         if isinstance(last_disc, (int, float)):
             status["last_discovery"] = datetime.fromtimestamp(last_disc).isoformat()
@@ -631,6 +676,8 @@ class InsteonBridge:
 
     # ------------------------------------------------------------------
     async def _publish_event(self, event: Dict[str, Any]) -> None:
+        if self._using_mock and "mode" not in event:
+            event["mode"] = "mock"
         try:
             self._event_queue.put_nowait(event)
         except asyncio.QueueFull:
@@ -660,6 +707,211 @@ class InsteonBridge:
         except ValueError:
             pass
 
+
+class MockState:
+    def __init__(self, value: Any):
+        self.value = value
+
+
+class MockEvent:
+    def __init__(self, name: str, device: "MockDevice", *, group: int = 0, button: str = ""):
+        self._name = name
+        self._device = device
+        self._group = group
+        self._button = button
+        self._callbacks: List[Callable[..., None]] = []
+
+    def subscribe(self, callback: Callable[..., None], force_strong_ref: bool = False) -> None:
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+    def unsubscribe(self, callback: Callable[..., None]) -> None:
+        with suppress(ValueError):
+            self._callbacks.remove(callback)
+
+    def trigger(self) -> None:
+        payload = {
+            "name": self._name,
+            "address": self._device.address.id,
+            "group": self._group,
+            "button": self._button,
+        }
+        for callback in list(self._callbacks):
+            try:
+                callback(**payload)
+            except Exception:
+                logging.getLogger("homebrain.insteon.bridge").debug(
+                    "Mock event callback failed", exc_info=True
+                )
+
+
+class MockGroup:
+    def __init__(self, name: str, device: "MockDevice", *, group: int = 1, is_dimmable: bool = False):
+        self._name = name
+        self._device = device
+        self._group = group
+        self._callbacks: List[Callable[..., None]] = []
+        self._value: Any = 0
+        self.is_dimmable = is_dimmable
+        self.name = name
+        self.group = group
+
+    def subscribe(self, callback: Callable[..., None], force_strong_ref: bool = False) -> None:
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+    def unsubscribe(self, callback: Callable[..., None]) -> None:
+        with suppress(ValueError):
+            self._callbacks.remove(callback)
+
+    def trigger(self, value: Any) -> None:
+        self._value = value
+        payload = {
+            "name": self._name,
+            "address": self._device.address.id,
+            "value": value,
+            "group": self._group,
+        }
+        for callback in list(self._callbacks):
+            try:
+                callback(**payload)
+            except Exception:
+                logging.getLogger("homebrain.insteon.bridge").debug(
+                    "Mock group callback failed", exc_info=True
+                )
+
+
+class MockDevice:
+    def __init__(self, address: str, name: str, *, category: int, subcategory: int, dimmable: bool):
+        normalized = address.replace(".", "").replace(":", "").lower()
+        self.address = SimpleNamespace(id=normalized)
+        self.name = name
+        self.cat = category
+        self.subcat = subcategory
+        self.product_key = "mock"
+        self.firmware_version = "1.0"
+        self.model = "MockDevice"
+        self.is_switch = True
+        self.is_dimmable = dimmable
+        self.supports_fast_on = True
+        self.supports_fast_off = True
+        self.supports_status = True
+        self.has_battery = False
+        self.states: Dict[str, MockState] = {
+            "on_off": MockState(0),
+            "level": MockState(0),
+        }
+        self.events: Dict[int, Dict[str, MockEvent]] = {
+            1: {
+                "on_event": MockEvent("on_event", self, group=1),
+                "off_event": MockEvent("off_event", self, group=1),
+                "on_fast_event": MockEvent("on_fast_event", self, group=1),
+                "off_fast_event": MockEvent("off_fast_event", self, group=1),
+            }
+        }
+        self.groups: Dict[int, MockGroup] = {
+            1: MockGroup("level", self, group=1, is_dimmable=dimmable)
+        }
+        self.last_update = datetime.now(timezone.utc)
+
+    def _set_level(self, level: int) -> None:
+        clamped = max(0, min(int(level), 255))
+        self.states["level"].value = clamped
+        self.states["on_off"].value = 1 if clamped else 0
+        group = self.groups.get(1)
+        if group:
+            group.trigger(clamped)
+        event_map = self.events.get(1, {})
+        if clamped:
+            event = event_map.get("on_event")
+        else:
+            event = event_map.get("off_event")
+        if event:
+            event.trigger()
+        self.last_update = datetime.now(timezone.utc)
+
+    async def async_turn_on(self, level: Optional[int] = None, **_: Any) -> None:
+        self._set_level(255 if level is None else level)
+
+    async def async_fast_on(self, level: Optional[int] = None, **_: Any) -> None:
+        await self.async_turn_on(level=level)
+
+    async def async_turn_off(self, **_: Any) -> None:
+        self._set_level(0)
+
+    async def async_fast_off(self, **_: Any) -> None:
+        await self.async_turn_off()
+
+    async def async_status_request(self, **_: Any) -> Dict[str, Any]:
+        return {"level": self.states["level"].value}
+
+    async def async_get_status(self, **_: Any) -> Dict[str, Any]:
+        return await self.async_status_request()
+
+    async def async_query_status(self, **_: Any) -> Dict[str, Any]:
+        return await self.async_status_request()
+
+
+class MockDeviceManager:
+    def __init__(self, loop: asyncio.AbstractEventLoop, *, cycle_seconds: float = 15.0):
+        self._loop = loop
+        self._cycle_seconds = max(1.0, cycle_seconds)
+        self._subscribers: List[Callable[..., None]] = []
+        self._tasks: List[asyncio.Task] = []
+        self._running = False
+        self._devices: Dict[str, MockDevice] = {
+            "112233": MockDevice("11.22.33", "Mock Living Lamp", category=0x01, subcategory=0x01, dimmable=True),
+            "445566": MockDevice("44.55.66", "Mock Porch Light", category=0x02, subcategory=0x06, dimmable=False),
+            "778899": MockDevice("77.88.99", "Mock Sensor", category=0x10, subcategory=0x0B, dimmable=False),
+        }
+        self.modem = SimpleNamespace(address=SimpleNamespace(id="fffffe"))
+
+    def values(self) -> Iterable[MockDevice]:
+        return self._devices.values()
+
+    def subscribe(self, callback: Callable[..., None], force_strong_ref: bool = False) -> None:
+        if callback not in self._subscribers:
+            self._subscribers.append(callback)
+        for device in self._devices.values():
+            try:
+                callback(action=DeviceAction.ADDED, address=device.address.id)
+            except Exception:
+                logging.getLogger("homebrain.insteon.bridge").debug(
+                    "Mock manager subscriber callback failed", exc_info=True
+                )
+
+    def unsubscribe(self, callback: Callable[..., None]) -> None:
+        with suppress(ValueError):
+            self._subscribers.remove(callback)
+
+    async def async_load(self, **_: Any) -> None:
+        return None
+
+    def start_runtime(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        for device in self._devices.values():
+            task = self._loop.create_task(self._cycle_device(device))
+            self._tasks.append(task)
+
+    async def async_close(self) -> None:
+        self._running = False
+        for task in list(self._tasks):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self._tasks.clear()
+
+    async def _cycle_device(self, device: MockDevice) -> None:
+        toggle = False
+        while self._running:
+            await asyncio.sleep(self._cycle_seconds)
+            toggle = not toggle
+            if toggle:
+                await device.async_turn_on(level=192 if device.is_dimmable else None)
+            else:
+                await device.async_turn_off()
 
 __all__ = [
     "InsteonBridge",

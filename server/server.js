@@ -194,6 +194,7 @@ const createMemoryStore = () => ({
     lastSync: null,
     lastSyncSummary: null,
     lastError: null,
+    mock: false,
   },
   userProfiles: [],
   elevenLabs: { voices: [], lastFetched: 0 },
@@ -324,6 +325,7 @@ const readInsteonDevicesFromDisk = () => {
           devices: Array.isArray(parsed.devices) ? parsed.devices : [],
           lastSync: parsed.lastSync || null,
           lastSyncSummary: parsed.lastSyncSummary || null,
+          mockMode: typeof parsed.mockMode === 'boolean' ? parsed.mockMode : undefined,
         };
       }
     }
@@ -347,8 +349,15 @@ const applyInsteonDeviceSnapshot = (devices, { lastSync = null, summary = null, 
   memoryStore.insteon.devices = normalized;
   memoryStore.insteon.lastSync = lastSync;
   memoryStore.insteon.lastSyncSummary = summary;
+  if (summary && typeof summary === 'object') {
+    if (typeof summary.mockMode === 'boolean') {
+      memoryStore.insteon.mock = summary.mockMode;
+    } else if (summary.mode) {
+      memoryStore.insteon.mock = summary.mode === 'mock';
+    }
+  }
   if (persist) {
-    writeInsteonDevicesToDisk({ devices: normalized, lastSync, lastSyncSummary: summary });
+    writeInsteonDevicesToDisk({ devices: normalized, lastSync, lastSyncSummary: summary, mockMode: memoryStore.insteon.mock });
   }
 };
 
@@ -356,6 +365,9 @@ const loadInsteonDevicesFromDisk = ({ log = true } = {}) => {
   const persisted = readInsteonDevicesFromDisk();
   if (persisted) {
     applyInsteonDeviceSnapshot(persisted.devices || [], { lastSync: persisted.lastSync || null, summary: persisted.lastSyncSummary || null, persist: false });
+    if (typeof persisted.mockMode === 'boolean') {
+      memoryStore.insteon.mock = persisted.mockMode;
+    }
     if (log) {
       console.log(`Loaded ${memoryStore.insteon.devices.length} Insteon device(s) from disk cache.`);
     }
@@ -419,10 +431,12 @@ function getResolvedInsteonPollInterval() {
 function recordInsteonBridgeStatus(status) {
   if (!status || typeof status !== 'object') {
     memoryStore.insteon.bridgeStatus = null;
+    memoryStore.insteon.mock = false;
     return null;
   }
   const snapshot = { ...status, fetchedAt: new Date().toISOString() };
   memoryStore.insteon.bridgeStatus = snapshot;
+  memoryStore.insteon.mock = Boolean(snapshot.mock_mode || snapshot.mode === 'mock');
   return snapshot;
 }
 
@@ -634,6 +648,12 @@ function handleInsteonEvent(event) {
     return;
   }
 
+  if (typeof event.mock_mode === 'boolean') {
+    memoryStore.insteon.mock = event.mock_mode;
+  } else if (event.mode === 'mock') {
+    memoryStore.insteon.mock = true;
+  }
+
   switch (event.type) {
     case 'bridge_status':
       recordInsteonBridgeStatus(event);
@@ -646,6 +666,7 @@ function handleInsteonEvent(event) {
           source: 'ws',
           mode: event.mode || 'ws',
           count: event.devices.length,
+          mockMode: event.mode === 'mock',
         };
         applyInsteonDeviceSnapshot(event.devices, { lastSync: new Date().toISOString(), summary, persist: true });
         memoryStore.insteon.lastError = null;
@@ -740,6 +761,7 @@ function connectInsteonWebSocket() {
 async function stopInsteonRuntime() {
   stopInsteonPoller();
   closeInsteonWebSocket({ scheduleReconnect: false });
+  memoryStore.insteon.mock = false;
 }
 
 async function refreshInsteonRuntime({ reason } = {}) {
@@ -1429,6 +1451,7 @@ app.get('/api/insteon/status', asyncHandler(async (req, res) => {
       lastSync: memoryStore.insteon.lastSync,
       pollInterval: getResolvedInsteonPollInterval(),
       lastError: memoryStore.insteon.lastError,
+      mockMode: memoryStore.insteon.mock,
     });
   }
 
@@ -1445,6 +1468,7 @@ app.get('/api/insteon/status', asyncHandler(async (req, res) => {
       lastSync: memoryStore.insteon.lastSync,
       pollInterval: getResolvedInsteonPollInterval(),
       lastError: memoryStore.insteon.lastError,
+      mockMode: memoryStore.insteon.mock,
     });
   } catch (error) {
     const statusCode = error.status ?? 502;
@@ -1461,6 +1485,7 @@ app.get('/api/insteon/devices', asyncHandler(async (_req, res) => {
     count: memoryStore.insteon.devices.length,
     lastSync: memoryStore.insteon.lastSync,
     pollInterval: getResolvedInsteonPollInterval(),
+    mockMode: memoryStore.insteon.mock,
   });
 }));
 
@@ -1488,6 +1513,7 @@ app.post('/api/insteon/sync', asyncHandler(async (req, res) => {
       lastSync: summary.lastSync,
       mode: summary.mode,
       devices: summary.devices || [],
+      mockMode: memoryStore.insteon.mock,
     });
   } catch (error) {
     const statusCode = error.status ?? 502;

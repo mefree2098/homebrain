@@ -8,6 +8,7 @@
 
 ### Completed
 - Created `docs/insteon/requirements.md` documenting baseline assumptions, persistence decisions, and integration points.
+- Delivered an offline mock PLM runtime (bridge + server) plus a smoke script so development/testing can continue while hardware is offline.
 - Added `docs/insteon/device-schema.md` capturing the JSON structure shared between the bridge and HomeBrain server.
 - Scaffolded Python bridge package at `remote-device/insteon/` with connection lifecycle, REST/WebSocket endpoints, caching, and auth hooks; verified syntax via `python -m compileall`.
 - Implemented Node server integration (settings fields, disk persistence helpers, `/api/insteon/*` endpoints, and shared HTTP client).

@@ -63,9 +63,12 @@ The persisted JSON file stores a wrapper object:
   "lastSyncSummary": {
     "mode": "live",
     "count": 2
-  }
+  },
+  "mockMode": false
 }
 ```
+
+`mockMode` indicates whether the underlying data originated from the bridge's offline mock runtime and helps the UI surface a clear banner while hardware is absent.
 
 `lastSync` and `lastSyncSummary` are optional metadata written by the Node server after each discovery run.
 
