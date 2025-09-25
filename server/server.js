@@ -294,6 +294,10 @@ const getMemoryStoreCounts = () => ({
   userProfiles: memoryStore.userProfiles.length,
   voiceCommands: memoryStore.voiceCommandHistory.length,
   securityAlarms: memoryStore.security?.alarm ? 1 : 0,
+  smartthingsDevices: memoryStore.smartthings?.devices?.length || 0,
+  smartthingsScenes: memoryStore.smartthings?.scenes?.length || 0,
+  insteonDevices: memoryStore.devices.filter((device) => (device.protocol || device.source || '').toLowerCase() === 'insteon'
+    || String(device._id || device.id || '').toLowerCase().startsWith('insteon-')).length,
 });
 
 const resetMemoryStore = ({ includeSamples = true, loadProfiles = true } = {}) => {
@@ -1155,6 +1159,38 @@ app.put('/api/security-alarm/configure', asyncHandler(async (req, res) => {
   return sendSuccess(res, {
     message: 'Security alarm configured',
     alarm: deepClone(memoryStore.security.alarm),
+  });
+}));
+
+app.delete('/api/maintenance/devices/smartthings', asyncHandler(async (_req, res) => {
+  const before = getMemoryStoreCounts();
+  const deletedCount = before.smartthingsDevices;
+  memoryStore.smartthings.devices = [];
+  memoryStore.smartthings.scenes = [];
+  const after = getMemoryStoreCounts();
+  return sendSuccess(res, {
+    message: 'SmartThings devices cleared',
+    deletedCount,
+    results: { before, after },
+    shouldReload: true,
+  });
+}));
+
+app.delete('/api/maintenance/devices/insteon', asyncHandler(async (_req, res) => {
+  const before = getMemoryStoreCounts();
+  const filterFn = (device) => {
+    const marker = (device.protocol || device.source || '').toLowerCase();
+    const id = String(device._id || device.id || '').toLowerCase();
+    return marker !== 'insteon' && !id.startsWith('insteon-');
+  };
+  memoryStore.devices = memoryStore.devices.filter(filterFn);
+  const after = getMemoryStoreCounts();
+  const deletedCount = Math.max(0, (before.insteonDevices || 0) - (after.insteonDevices || 0));
+  return sendSuccess(res, {
+    message: 'Insteon devices cleared',
+    deletedCount,
+    results: { before, after },
+    shouldReload: true,
   });
 }));
 

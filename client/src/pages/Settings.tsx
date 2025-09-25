@@ -84,7 +84,7 @@ export function Settings() {
   const [syncingSmartThings, setSyncingSmartThings] = useState(false)
   const [syncingInsteon, setSyncingInsteon] = useState(false)
   const [testingInsteon, setTestingInsteon] = useState(false)
-  const [clearingSTDevices, setClearingSTDevices] = useState(false)
+  const [clearingSmartThingsDevices, setClearingSmartThingsDevices] = useState(false)
   const [clearingInsteonDevices, setClearingInsteonDevices] = useState(false)
   const [resettingSettings, setResettingSettings] = useState(false)
   const [clearingSTIntegration, setClearingSTIntegration] = useState(false)
@@ -734,7 +734,7 @@ export function Settings() {
   };
 
   const handleClearSTDevices = async () => {
-    setClearingSTDevices(true);
+    setClearingSmartThingsDevices(true);
     try {
       console.log('Clearing SmartThings devices...');
       const response = await clearSmartThingsDevices();
@@ -742,8 +742,11 @@ export function Settings() {
       if (response.success) {
         toast({
           title: "Devices Cleared",
-          description: `Successfully cleared ${response.deletedCount} SmartThings devices`
+          description: `Successfully cleared ${response.deletedCount ?? 0} SmartThings devices`
         });
+        if (response.shouldReload) {
+          setTimeout(() => window.location.reload(), 400);
+        }
       }
     } catch (error) {
       console.error('Clear SmartThings devices failed:', error);
@@ -753,7 +756,7 @@ export function Settings() {
         variant: "destructive"
       });
     } finally {
-      setClearingSTDevices(false);
+      setClearingSmartThingsDevices(false);
     }
   };
 
@@ -766,8 +769,11 @@ export function Settings() {
       if (response.success) {
         toast({
           title: "Devices Cleared",
-          description: `Successfully cleared ${response.deletedCount} INSTEON devices`
+          description: `Successfully cleared ${response.deletedCount ?? 0} INSTEON devices`
         });
+        if (response.shouldReload) {
+          setTimeout(() => window.location.reload(), 400);
+        }
       }
     } catch (error) {
       console.error('Clear INSTEON devices failed:', error);
@@ -1640,10 +1646,10 @@ export function Settings() {
                       variant="destructive"
                       size="sm"
                       onClick={handleClearSTDevices}
-                      disabled={clearingSTDevices}
+                      disabled={clearingSmartThingsDevices}
                       className="w-full"
                     >
-                      {clearingSTDevices ? (
+                      {clearingSmartThingsDevices ? (
                         <>
                           <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2" />
                           Clearing...
