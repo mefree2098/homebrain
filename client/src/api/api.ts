@@ -61,8 +61,10 @@ const setupInterceptors = (apiInstance: typeof axios) => {
     async (error: AxiosError): Promise<any> => {
       const originalRequest = error.config as InternalAxiosRequestConfig & { _retry?: boolean };
 
-      // Only refresh token when we get a 401/403 error (token is invalid/expired)
-      if (error.response?.status && [401, 403].includes(error.response.status) &&
+      const status = error.response?.status;
+      const shouldAttemptRefresh = status === 401;
+
+      if (shouldAttemptRefresh &&
           !originalRequest._retry &&
           originalRequest.url && !isRefreshTokenEndpoint(originalRequest.url)) {
         originalRequest._retry = true;
