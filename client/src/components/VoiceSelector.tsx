@@ -131,16 +131,10 @@ export function VoiceSelector({
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="pl-9"
                   autoComplete="off"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => {
-                    e.stopPropagation();
-                    e.nativeEvent.stopImmediatePropagation?.();
-                  }}
-                  onKeyUp={(e) => {
-                    e.stopPropagation();
-                    e.nativeEvent.stopImmediatePropagation?.();
-                  }}
+                  onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                  onKeyDownCapture={(e) => { e.stopPropagation(); e.nativeEvent.stopImmediatePropagation?.(); }}
+                  onKeyUpCapture={(e) => { e.stopPropagation(); e.nativeEvent.stopImmediatePropagation?.(); }}
                 />
               </div>
             </div>
@@ -200,3 +194,4 @@ export function VoiceSelector({
     </div>
   );
 }
+

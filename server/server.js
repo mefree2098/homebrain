@@ -272,6 +272,7 @@ const writeUserProfilesToDisk = (profiles) => {
 const persistedUserProfiles = readUserProfilesFromDisk();
 if (Array.isArray(persistedUserProfiles)) {
   memoryStore.userProfiles = persistedUserProfiles;
+  console.log(`Loaded ${persistedUserProfiles.length} user profile(s) from disk cache.`);
 }
 
 async function readSettingsPersisted() {
@@ -2147,6 +2148,12 @@ startServer().catch((error) => {
 
 async function gracefulShutdown(signal) {
   console.log(`HomeBrain server received ${signal}; shutting down...`);
+  try {
+    writeUserProfilesToDisk(memoryStore.userProfiles);
+  } catch (error) {
+    console.warn('Failed to persist user profiles during shutdown:', error.message);
+  }
+
   if (mongoose.connection.readyState === 1) {
     try {
       await mongoose.connection.close();
