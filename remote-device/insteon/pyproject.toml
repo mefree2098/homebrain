@@ -1,0 +1,20 @@
+[project]
+name = "homebrain-insteon"
+version = "0.1.0"
+description = "HomeBrain Insteon PLM bridge service"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "HomeBrain" }]
+dependencies = [
+  "aiohttp>=3.9",
+  "pyinsteon>=1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+homebrain-insteon-bridge = "homebrain_insteon.http:main"
