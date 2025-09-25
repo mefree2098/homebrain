@@ -196,6 +196,12 @@ const ELEVENLABS_CACHE_TTL_MS = Number(process.env.ELEVENLABS_CACHE_TTL_MS || 5 
 const LOGS_DIR = path.join(__dirname, 'logs');
 const CLIENT_LOG_FILE = path.join(LOGS_DIR, 'client-logs.ndjson');
 
+const ensureLogsDir = () => {
+  if (!fs.existsSync(LOGS_DIR)) {
+    fs.mkdirSync(LOGS_DIR, { recursive: true });
+  }
+};
+
 const DEFAULT_SETTINGS = {
   location: 'New York, NY',
   timezone: 'America/New_York',
