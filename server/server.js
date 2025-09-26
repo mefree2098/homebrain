@@ -12,7 +12,10 @@ const path = require('path');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const fsPromises = fs.promises;
-const { randomUUID } = require('crypto');
+const https = require('https');
+const tls = require('tls');
+const crypto = require('crypto');
+const { randomUUID, X509Certificate } = crypto;
 require('dotenv').config();
 
 const { createInsteonClient, normalizeBaseUrl } = require('./utils/insteonClient');
@@ -214,6 +217,13 @@ const createMemoryStore = () => ({
 
 let memoryStore = createMemoryStore();
 
+let currentServerTransport = 'http';
+let httpServerInstance = null;
+let httpsServerInstance = null;
+
+const SSL_PLACEHOLDER = '\u0007'.repeat(32);
+const SSL_SENSITIVE_KEYS = new Set(['sslPrivateKey', 'sslCertificate', 'sslCertificateChain']);
+
 const ELEVENLABS_BASE_URL = process.env.ELEVENLABS_BASE_URL || 'https://api.elevenlabs.io';
 const ELEVENLABS_TIMEOUT_MS = Number(process.env.ELEVENLABS_TIMEOUT_MS || 15000);
 const ELEVENLABS_CACHE_TTL_MS = Number(process.env.ELEVENLABS_CACHE_TTL_MS || 5 * 60 * 1000);
@@ -254,6 +264,13 @@ const DEFAULT_SETTINGS = {
   localLlmEndpoint: 'http://localhost:8080',
   localLlmModel: 'llama2-7b',
   enableSecurityMode: false,
+  sslEnabled: false,
+  sslForceHttps: false,
+  sslPrivateKey: '',
+  sslCertificate: '',
+  sslCertificateChain: '',
+  sslLastAppliedAt: null,
+  sslLastError: null,
 };
 
 let appSettings = { ...DEFAULT_SETTINGS };
@@ -881,6 +898,7 @@ async function readSettingsPersisted() {
 async function writeSettingsPersisted(updates) {
   const current = await readSettingsPersisted();
   const next = { ...current, ...updates };
+  normalizeSslFields(next);
 
   if (isSettingsDbConnected()) {
     try {
@@ -913,6 +931,7 @@ async function ensureSettingsLoaded() {
   settingsLoadPromise = (async () => {
     const persisted = await readSettingsPersisted();
     appSettings = { ...DEFAULT_SETTINGS, ...persisted };
+    normalizeSslFields(appSettings);
     ensureInsteonEnabledFlag();
     invalidateInsteonClient();
     settingsLoaded = true;
@@ -926,22 +945,129 @@ async function ensureSettingsLoaded() {
   }
 }
 
+const PEM_HEADER_PATTERN = /^-----BEGIN [A-Z0-9 ]+-----/m;
+const CERTIFICATE_HEADER_PATTERN = /-----BEGIN CERTIFICATE-----/;
+
+const normalizePem = (input) => {
+  if (typeof input !== 'string') {
+    return '';
+  }
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return '';
+  }
+  if (!PEM_HEADER_PATTERN.test(trimmed)) {
+    return trimmed;
+  }
+  return `${trimmed.replace(/\r\n/g, '\n')}\n`;
+};
+
+const splitCertificateChain = (pemString) => {
+  const normalized = normalizePem(pemString);
+  if (!normalized || !CERTIFICATE_HEADER_PATTERN.test(normalized)) {
+    return [];
+  }
+  return normalized
+    .split(/(?=-----BEGIN CERTIFICATE-----)/g)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => (block.endsWith('\n') ? block : `${block}\n`));
+};
+
+const normalizeSslFields = (settings) => {
+  if (!settings || typeof settings !== 'object') {
+    return;
+  }
+  ['sslPrivateKey', 'sslCertificate', 'sslCertificateChain'].forEach((key) => {
+    if (typeof settings[key] === 'string' && settings[key]) {
+      settings[key] = normalizePem(settings[key]);
+    }
+  });
+};
+
+const buildSslCredentials = (settings) => {
+  if (!settings || typeof settings !== 'object') {
+    throw new Error('SSL settings are missing');
+  }
+  const key = normalizePem(settings.sslPrivateKey || '');
+  const cert = normalizePem(settings.sslCertificate || '');
+
+  if (!key || !key.includes('-----BEGIN')) {
+    const error = new Error('SSL private key is missing or not in PEM format');
+    error.status = 400;
+    throw error;
+  }
+  if (!cert || !cert.includes('-----BEGIN CERTIFICATE-----')) {
+    const error = new Error('SSL certificate is missing or not in PEM format');
+    error.status = 400;
+    throw error;
+  }
+
+  const credentials = { key, cert };
+  const chainParts = splitCertificateChain(settings.sslCertificateChain || '');
+  if (chainParts.length === 1) {
+    credentials.ca = chainParts[0];
+  } else if (chainParts.length > 1) {
+    credentials.ca = chainParts;
+  }
+
+  return credentials;
+};
+
+const SENSITIVE_MASK_KEYS = [
+  'elevenlabsApiKey',
+  'smartthingsToken',
+  'smartthingsClientSecret',
+  'openaiApiKey',
+  'anthropicApiKey',
+  'insteonAuthToken',
+];
+
+const buildSslStatus = (settings) => {
+  const status = {
+    enabled: !!settings.sslEnabled,
+    forceHttps: !!settings.sslForceHttps,
+    configured: !!(settings.sslPrivateKey && settings.sslCertificate),
+    httpsActive: currentServerTransport === 'https',
+    lastAppliedAt: settings.sslLastAppliedAt || null,
+    lastError: settings.sslLastError || null,
+  };
+
+  if (status.configured && typeof settings.sslCertificate === 'string' && settings.sslCertificate.includes('BEGIN CERTIFICATE') && X509Certificate) {
+    try {
+      const certificate = new X509Certificate(normalizePem(settings.sslCertificate));
+      status.subject = certificate.subject;
+      status.issuer = certificate.issuer;
+      status.validFrom = certificate.validFrom;
+      status.validTo = certificate.validTo;
+      if (certificate.subjectAltName) {
+        status.altNames = certificate.subjectAltName.split(',').map((entry) => entry.trim());
+      }
+      status.fingerprint256 = certificate.fingerprint256;
+    } catch (error) {
+      status.parseError = error.message;
+    }
+  }
+
+  return status;
+};
+
 const maskSensitiveSettings = (settings) => {
   const masked = { ...settings };
-  const sensitiveKeys = [
-    'elevenlabsApiKey',
-    'smartthingsToken',
-    'smartthingsClientSecret',
-    'openaiApiKey',
-    'anthropicApiKey',
-    'insteonAuthToken',
-  ];
 
-  sensitiveKeys.forEach((key) => {
-    if (masked[key]) {
+  SENSITIVE_MASK_KEYS.forEach((key) => {
+    if (typeof masked[key] === 'string' && masked[key]) {
       masked[key] = masked[key].replace(/.(?=.{4})/g, '*');
     }
   });
+
+  SSL_SENSITIVE_KEYS.forEach((key) => {
+    if (masked[key]) {
+      masked[key] = SSL_PLACEHOLDER;
+    }
+  });
+
+  masked.sslStatus = buildSslStatus(settings);
 
   return masked;
 };
@@ -1257,6 +1383,16 @@ const testMockProvider = (provider) => ({
 
 const app = express();
 
+app.enable('trust proxy');
+
+app.use((req, res, next) => {
+  if (appSettings.sslEnabled && appSettings.sslForceHttps && !req.secure) {
+    const host = req.headers.host || req.hostname;
+    return res.redirect(301, `https://${host}${req.originalUrl}`);
+  }
+  return next();
+});
+
 const corsOptions = ACCESS_CONTROL_ALLOWLIST.length
   ? {
       origin(origin, callback) {
@@ -1392,6 +1528,7 @@ const SENSITIVE_KEYS = new Set([
   'openaiApiKey',
   'anthropicApiKey',
   'insteonAuthToken',
+  ...SSL_SENSITIVE_KEYS,
 ]);
 
 function stripSensitivePlaceholders(partialSettings, currentSettings) {
@@ -1420,11 +1557,21 @@ app.put('/api/settings', asyncHandler(async (req, res) => {
   await ensureSettingsLoaded();
   const updates = req.body || {};
   const merged = stripSensitivePlaceholders(updates, appSettings);
+
+  if (merged.sslEnabled !== undefined) {
+    merged.sslEnabled = merged.sslEnabled === true || merged.sslEnabled === 'true' || merged.sslEnabled === 1 || merged.sslEnabled === '1';
+  }
+  if (merged.sslForceHttps !== undefined) {
+    merged.sslForceHttps = merged.sslForceHttps === true || merged.sslForceHttps === 'true' || merged.sslForceHttps === 1 || merged.sslForceHttps === '1';
+  }
+
   const saved = await writeSettingsPersisted(merged);
   appSettings = { ...DEFAULT_SETTINGS, ...saved };
+  normalizeSslFields(appSettings);
   ensureInsteonEnabledFlag();
   invalidateInsteonClient();
   await refreshInsteonRuntime({ reason: 'settings_updated' });
+  await applySslConfiguration({ reason: 'settings_updated' });
   return sendSuccess(res, { message: 'Settings updated', settings: maskSensitiveSettings(appSettings) });
 }));
 
@@ -2934,6 +3081,124 @@ const SETTINGS_DB_URI = process.env.DATABASE_URL || process.env.MONGODB_URI || n
 const SETTINGS_DB_TIMEOUT_MS = Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 2000);
 const SETTINGS_DB_OPTIONS = { serverSelectionTimeoutMS: SETTINGS_DB_TIMEOUT_MS };
 
+async function closeServerInstance(server, label) {
+  if (!server) {
+    return;
+  }
+
+  await new Promise((resolve) => {
+    server.close((error) => {
+      if (error) {
+        console.warn(`[Server] Failed to close ${label} server: ${error.message}`);
+      }
+      resolve();
+    });
+  });
+}
+
+async function startHttpServer({ reason } = {}) {
+  if (httpServerInstance && currentServerTransport === 'http') {
+    return;
+  }
+
+  if (httpsServerInstance) {
+    await closeServerInstance(httpsServerInstance, 'HTTPS');
+    httpsServerInstance = null;
+  }
+
+  await new Promise((resolve, reject) => {
+    const server = app.listen(PORT, HOST, () => {
+      server.off('error', onError);
+      currentServerTransport = 'http';
+      httpServerInstance = server;
+      console.log(`HomeBrain API listening on http://${HOST}:${PORT}${reason ? ` (${reason})` : ''}`);
+      resolve();
+    });
+
+    const onError = (error) => {
+      server.off('error', onError);
+      reject(error);
+    };
+
+    server.on('error', onError);
+  });
+}
+
+async function startHttpsServer(credentials, { reason } = {}) {
+  if (httpServerInstance) {
+    await closeServerInstance(httpServerInstance, 'HTTP');
+    httpServerInstance = null;
+  }
+
+  if (httpsServerInstance) {
+    await closeServerInstance(httpsServerInstance, 'HTTPS');
+    httpsServerInstance = null;
+  }
+
+  await new Promise((resolve, reject) => {
+    const server = https.createServer(credentials, app);
+
+    const onError = (error) => {
+      server.off('error', onError);
+      reject(error);
+    };
+
+    server.on('error', onError);
+
+    server.listen(PORT, HOST, () => {
+      server.off('error', onError);
+      httpsServerInstance = server;
+      currentServerTransport = 'https';
+      console.log(`HomeBrain API listening on https://${HOST}:${PORT}${reason ? ` (${reason})` : ''}`);
+      resolve();
+    });
+  });
+}
+
+async function applySslConfiguration({ reason = 'update', throwOnError = true } = {}) {
+  await ensureSettingsLoaded();
+
+  if (!appSettings.sslEnabled) {
+    if (httpsServerInstance) {
+      await closeServerInstance(httpsServerInstance, 'HTTPS');
+      httpsServerInstance = null;
+    }
+    if (!httpServerInstance) {
+      await startHttpServer({ reason: 'ssl_disabled' });
+    }
+    if (appSettings.sslLastError) {
+      appSettings.sslLastError = null;
+      await writeSettingsPersisted({ sslLastError: null });
+    }
+    return { active: false, https: false };
+  }
+
+  try {
+    const credentials = buildSslCredentials(appSettings);
+    tls.createSecureContext(credentials);
+    await startHttpsServer(credentials, { reason });
+    const appliedAt = new Date().toISOString();
+    appSettings.sslLastAppliedAt = appliedAt;
+    appSettings.sslLastError = null;
+    await writeSettingsPersisted({ sslLastAppliedAt: appliedAt, sslLastError: null });
+    return { active: true, https: true };
+  } catch (error) {
+    const message = error.message || 'Failed to apply SSL certificate';
+    console.error(`[SSL] ${message}`);
+    appSettings.sslLastError = message;
+    await writeSettingsPersisted({ sslLastError: message });
+    await startHttpServer({ reason: 'ssl_error_fallback' });
+    if (throwOnError) {
+      if (!error.status) {
+        const wrapped = new Error(message);
+        wrapped.status = 400;
+        throw wrapped;
+      }
+      throw error;
+    }
+    return { active: false, https: false, error: message };
+  }
+}
 
 async function startServer() {
   await initializeUserStore();
@@ -2943,6 +3208,7 @@ async function startServer() {
     console.log(`[Auth] Default admin account ready: ${DEFAULT_ADMIN_EMAIL}`);
   }
   await ensureSettingsLoaded();
+  normalizeSslFields(appSettings);
   await refreshInsteonRuntime({ reason: 'startup' });
   if (SETTINGS_DB_URI) {
     if (mongoose.connection.readyState === 0) {
@@ -2959,9 +3225,8 @@ async function startServer() {
     console.log('Settings DB URI not provided; using file persistence.');
   }
 
-  app.listen(PORT, HOST, () => {
-    console.log(`HomeBrain API listening on http://${HOST}:${PORT}`);
-  });
+  await startHttpServer({ reason: 'startup' });
+  await applySslConfiguration({ reason: 'startup', throwOnError: false });
 }
 
 startServer().catch((error) => {
@@ -2977,6 +3242,11 @@ async function gracefulShutdown(signal) {
   } catch (error) {
     console.warn('Failed to persist user profiles during shutdown:', error.message);
   }
+
+  await closeServerInstance(httpsServerInstance, 'HTTPS');
+  httpsServerInstance = null;
+  await closeServerInstance(httpServerInstance, 'HTTP');
+  httpServerInstance = null;
 
   if (mongoose.connection.readyState === 1) {
     try {

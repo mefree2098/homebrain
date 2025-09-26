@@ -124,6 +124,34 @@ const SettingsSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  sslEnabled: {
+    type: Boolean,
+    default: false
+  },
+  sslForceHttps: {
+    type: Boolean,
+    default: false
+  },
+  sslPrivateKey: {
+    type: String,
+    default: ''
+  },
+  sslCertificate: {
+    type: String,
+    default: ''
+  },
+  sslCertificateChain: {
+    type: String,
+    default: ''
+  },
+  sslLastAppliedAt: {
+    type: Date,
+    default: null
+  },
+  sslLastError: {
+    type: String,
+    default: null
+  },
   
   // Metadata
   lastModified: {
@@ -202,7 +230,17 @@ SettingsSchema.methods.toSanitized = function() {
   if (sanitized.insteonAuthToken) {
     sanitized.insteonAuthToken = sanitized.insteonAuthToken.replace(/.(?=.{4})/g, '*');
   }
-  
+  const sslPlaceholder = '\u0007'.repeat(32);
+  if (sanitized.sslPrivateKey) {
+    sanitized.sslPrivateKey = sslPlaceholder;
+  }
+  if (sanitized.sslCertificate) {
+    sanitized.sslCertificate = sslPlaceholder;
+  }
+  if (sanitized.sslCertificateChain) {
+    sanitized.sslCertificateChain = sslPlaceholder;
+  }
+
   return sanitized;
 };
 

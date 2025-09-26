@@ -41,6 +41,11 @@ export const updateSettings = async (settings: {
   anthropicModel?: string;
   localLlmEndpoint?: string;
   localLlmModel?: string;
+  sslEnabled?: boolean;
+  sslForceHttps?: boolean;
+  sslPrivateKey?: string;
+  sslCertificate?: string;
+  sslCertificateChain?: string;
 }) => {
   try {
     const response = await api.put('/api/settings', settings);

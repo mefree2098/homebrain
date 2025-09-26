@@ -5,6 +5,8 @@ import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Textarea } from "@/components/ui/textarea"
+import { Badge } from "@/components/ui/badge"
 import {
   Settings as SettingsIcon,
   Wifi,
@@ -31,7 +33,10 @@ import {
   Activity,
   HardDrive,
   Wrench,
-  PlugZap
+  PlugZap,
+  ShieldCheck,
+  Lock,
+  AlertTriangle
 } from "lucide-react"
 import { useToast } from "@/hooks/useToast"
 import { useForm } from "react-hook-form"
@@ -77,6 +82,40 @@ export function Settings() {
   const [testingSmartThings, setTestingSmartThings] = useState(false)
   const [configuringSmartThings, setConfiguringSmartThings] = useState(false)
   const [disconnectingSmartThings, setDisconnectingSmartThings] = useState(false)
+  const [sslStatus, setSslStatus] = useState<any>(null)
+
+  const SENSITIVE_PLACEHOLDER = '\u0007'.repeat(32)
+  const SENSITIVE_FIELDS = new Set([
+    'elevenlabsApiKey',
+    'smartthingsToken',
+    'smartthingsClientSecret',
+    'openaiApiKey',
+    'anthropicApiKey',
+    'sslPrivateKey',
+    'sslCertificate',
+    'sslCertificateChain'
+  ])
+
+  const sslEnabled = watch('sslEnabled');
+  const sslForceHttpsValue = watch('sslForceHttps');
+  const sslPrivateKeyValue = watch('sslPrivateKey');
+  const sslCertificateValue = watch('sslCertificate');
+  const sslChainValue = watch('sslCertificateChain');
+  const hasStoredPrivateKey = typeof sslPrivateKeyValue === 'string' && sslPrivateKeyValue.startsWith('\u0007');
+  const hasStoredCertificate = typeof sslCertificateValue === 'string' && sslCertificateValue.startsWith('\u0007');
+  const hasStoredChain = typeof sslChainValue === 'string' && sslChainValue.startsWith('\u0007');
+
+  const derivedSslStatus = sslStatus ? { ...sslStatus, enabled: sslEnabled } : { enabled: sslEnabled, configured: hasStoredPrivateKey && hasStoredCertificate, httpsActive: false };
+
+  const formatDateTime = (value?: string | null) => {
+    if (!value) return '—';
+    try {
+      return new Date(value).toLocaleString();
+    } catch (error) {
+      console.warn('Failed to format date:', error);
+      return String(value);
+    }
+  };
 
   // Maintenance operation states
   const [clearingFakeData, setClearingFakeData] = useState(false)
@@ -114,7 +153,12 @@ export function Settings() {
       anthropicModel: "claude-3-sonnet-20240229",
       localLlmEndpoint: "http://localhost:8080",
       localLlmModel: "llama2-7b",
-      enableSecurityMode: false
+      enableSecurityMode: false,
+      sslEnabled: false,
+      sslForceHttps: false,
+      sslPrivateKey: "",
+      sslCertificate: "",
+      sslCertificateChain: ""
     }
   })
 
@@ -129,19 +173,27 @@ export function Settings() {
           console.log('Loaded settings:', response.settings);
           
           // Update form values with loaded settings, handle masked sensitive fields
+          if ('sslStatus' in response.settings) {
+            setSslStatus(response.settings.sslStatus);
+          } else {
+            setSslStatus(null);
+          }
+
           Object.entries(response.settings).forEach(([key, value]) => {
-            if (value !== undefined) {
-              // For masked sensitive fields, show a placeholder indicating key is configured
-              if ((key === 'elevenlabsApiKey' || key === 'smartthingsToken' || key === 'smartthingsClientSecret' || key === 'openaiApiKey' || key === 'anthropicApiKey') &&
-                  typeof value === 'string' && value.includes('*')) {
+            if (key === 'sslStatus' || value === undefined) {
+              return;
+            }
+
+            if (SENSITIVE_FIELDS.has(key) && typeof value === 'string') {
+              if (value.startsWith('\u0007') || value.includes('*')) {
                 console.log(`Found masked field: ${key}, showing placeholder`);
-                setValue(key, '••••••••••••••••••••••••••••••••••••••••••••••••••'); // Placeholder to show key is configured
+                setValue(key as any, SENSITIVE_PLACEHOLDER);
                 return;
               }
-              setValue(key, value);
             }
+
+            setValue(key as any, value as any);
           });
-          
           toast({
             title: "Settings Loaded",
             description: "Your settings have been loaded successfully"
@@ -218,26 +270,23 @@ export function Settings() {
       console.log('Saving settings:', data)
       
       // Don't send placeholder values to backend - preserve existing sensitive fields
-      const settingsToSave = { ...data };
-      if (settingsToSave.elevenlabsApiKey && settingsToSave.elevenlabsApiKey.startsWith('••••')) {
-        delete settingsToSave.elevenlabsApiKey; // Don't update if it's just the placeholder
-      }
-      if (settingsToSave.smartthingsToken && settingsToSave.smartthingsToken.startsWith('••••')) {
-        delete settingsToSave.smartthingsToken; // Don't update if it's just the placeholder
-      }
-      if (settingsToSave.smartthingsClientSecret && settingsToSave.smartthingsClientSecret.startsWith('••••')) {
-        delete settingsToSave.smartthingsClientSecret; // Don't update if it's just the placeholder
-      }
-      if (settingsToSave.openaiApiKey && settingsToSave.openaiApiKey.startsWith('••••')) {
-        delete settingsToSave.openaiApiKey; // Don't update if it's just the placeholder
-      }
-      if (settingsToSave.anthropicApiKey && settingsToSave.anthropicApiKey.startsWith('••••')) {
-        delete settingsToSave.anthropicApiKey; // Don't update if it's just the placeholder
-      }
-      
+      const settingsToSave: Record<string, any> = { ...data };
+      Object.entries(settingsToSave).forEach(([key, value]) => {
+        if (typeof value === 'string') {
+          if (SENSITIVE_FIELDS.has(key) && value.startsWith('')) {
+            delete settingsToSave[key];
+            return;
+          }
+          settingsToSave[key] = value.trim();
+        }
+      });
+
       const response = await updateSettings(settingsToSave);
-      
+
       if (response.success) {
+        if (response.settings && typeof response.settings === 'object' && 'sslStatus' in response.settings) {
+          setSslStatus(response.settings.sslStatus);
+        }
         toast({
           title: "Settings Saved",
           description: response.message || "Your settings have been saved successfully"
@@ -1323,203 +1372,7 @@ export function Settings() {
                   AI/LLM Providers
                 </CardTitle>
               </CardHeader>
-              <CardContent className="space-y-6">
-                <div>
-                  <label className="text-sm font-medium">AI Provider</label>
-                  <Select value={watch("llmProvider")} onValueChange={(value) => setValue("llmProvider", value)}>
-                    <SelectTrigger className="mt-1">
-                      <SelectValue placeholder="Select AI provider" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="openai">OpenAI</SelectItem>
-                      <SelectItem value="anthropic">Anthropic</SelectItem>
-                      <SelectItem value="local">Local LLM</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Choose your preferred AI provider for voice command processing
-                  </p>
-                </div>
-
-                {/* OpenAI Settings */}
-                <div className="space-y-4 p-4 border rounded-lg bg-blue-50/50">
-                  <div className="flex items-center gap-2">
-                    <Cpu className="h-4 w-4 text-blue-600" />
-                    <h4 className="font-medium text-blue-900">OpenAI Configuration</h4>
-                  </div>
-                  
-                  <div>
-                    <label className="text-sm font-medium">OpenAI API Key</label>
-                    <div className="flex gap-2 mt-1">
-                      <Input
-                        {...register("openaiApiKey")}
-                        type="password"
-                        placeholder={watch("openaiApiKey")?.startsWith('••••') ? "API key configured" : "Enter OpenAI API key"}
-                        className="flex-1"
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={handleTestOpenAIKey}
-                        disabled={testingOpenAI}
-                        className="shrink-0"
-                      >
-                        {testingOpenAI ? (
-                          <>
-                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-600 mr-2" />
-                            Testing...
-                          </>
-                        ) : (
-                          <>
-                            <TestTube className="h-4 w-4 mr-2" />
-                            Test
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Required for OpenAI GPT models. Get your API key from OpenAI Platform.
-                    </p>
-                  </div>
-                  
-                  <div>
-                    <label className="text-sm font-medium">OpenAI Model</label>
-                    <Select value={watch("openaiModel")} onValueChange={(value) => setValue("openaiModel", value)}>
-                      <SelectTrigger className="mt-1">
-                        <SelectValue placeholder="Select OpenAI model" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="gpt-4">GPT-4</SelectItem>
-                        <SelectItem value="gpt-4-turbo">GPT-4 Turbo</SelectItem>
-                        <SelectItem value="gpt-3.5-turbo">GPT-3.5 Turbo</SelectItem>
-                        <SelectItem value="gpt-4o">GPT-4o</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                {/* Anthropic Settings */}
-                <div className="space-y-4 p-4 border rounded-lg bg-orange-50/50">
-                  <div className="flex items-center gap-2">
-                    <Cpu className="h-4 w-4 text-orange-600" />
-                    <h4 className="font-medium text-orange-900">Anthropic Configuration</h4>
-                  </div>
-                  
-                  <div>
-                    <label className="text-sm font-medium">Anthropic API Key</label>
-                    <div className="flex gap-2 mt-1">
-                      <Input
-                        {...register("anthropicApiKey")}
-                        type="password"
-                        placeholder={watch("anthropicApiKey")?.startsWith('••••') ? "API key configured" : "Enter Anthropic API key"}
-                        className="flex-1"
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={handleTestAnthropicKey}
-                        disabled={testingAnthropic}
-                        className="shrink-0"
-                      >
-                        {testingAnthropic ? (
-                          <>
-                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-600 mr-2" />
-                            Testing...
-                          </>
-                        ) : (
-                          <>
-                            <TestTube className="h-4 w-4 mr-2" />
-                            Test
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Required for Anthropic Claude models. Get your API key from Anthropic Console.
-                    </p>
-                  </div>
-                  
-                  <div>
-                    <label className="text-sm font-medium">Anthropic Model</label>
-                    <Select value={watch("anthropicModel")} onValueChange={(value) => setValue("anthropicModel", value)}>
-                      <SelectTrigger className="mt-1">
-                        <SelectValue placeholder="Select Anthropic model" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="claude-3-sonnet-20240229">Claude 3 Sonnet</SelectItem>
-                        <SelectItem value="claude-3-haiku-20240307">Claude 3 Haiku</SelectItem>
-                        <SelectItem value="claude-3-opus-20240229">Claude 3 Opus</SelectItem>
-                        <SelectItem value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                </div>
-
-                {/* Local LLM Settings */}
-                <div className="space-y-4 p-4 border rounded-lg bg-green-50/50">
-                  <div className="flex items-center gap-2">
-                    <Server className="h-4 w-4 text-green-600" />
-                    <h4 className="font-medium text-green-900">Local LLM Configuration</h4>
-                  </div>
-                  
-                  <div>
-                    <label className="text-sm font-medium">Local LLM Endpoint</label>
-                    <div className="flex gap-2 mt-1">
-                      <Input
-                        {...register("localLlmEndpoint")}
-                        placeholder="http://localhost:8080"
-                        className="flex-1"
-                      />
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={handleTestLocalLLM}
-                        disabled={testingLocalLLM}
-                        className="shrink-0"
-                      >
-                        {testingLocalLLM ? (
-                          <>
-                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-gray-600 mr-2" />
-                            Testing...
-                          </>
-                        ) : (
-                          <>
-                            <TestTube className="h-4 w-4 mr-2" />
-                            Test
-                          </>
-                        )}
-                      </Button>
-                    </div>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      URL endpoint for your local LLM server (e.g., llama.cpp, Ollama, etc.)
-                    </p>
-                  </div>
-                  
-                  <div>
-                    <label className="text-sm font-medium">Local LLM Model</label>
-                    <Input
-                      {...register("localLlmModel")}
-                      placeholder="llama2-7b"
-                      className="mt-1"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Name of the model to use on your local LLM server
-                    </p>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          <TabsContent value="security" className="space-y-6">
-            <Card className="bg-white/80 backdrop-blur-sm border-0 shadow-lg">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Shield className="h-5 w-5 text-red-600" />
-                  Security Settings
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
+              <CardContent className="space-y-5">
                 <div className="flex items-center justify-between">
                   <div>
                     <p className="font-medium">Security Mode</p>
@@ -1527,13 +1380,156 @@ export function Settings() {
                       Enhanced security features and monitoring
                     </p>
                   </div>
-                  <Switch checked={watch("enableSecurityMode")} onCheckedChange={(checked) => setValue("enableSecurityMode", checked)} />
+                  <Switch
+                    checked={watch("enableSecurityMode")}
+                    onCheckedChange={(checked) => setValue("enableSecurityMode", checked)}
+                  />
                 </div>
+
                 <div className="p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800">
                   <p className="text-sm text-yellow-800 dark:text-yellow-200">
-                    <strong>Privacy Notice:</strong> All voice processing happens locally on your device. 
+                    <strong>Privacy Notice:</strong> All voice processing happens locally on your device.
                     No voice data is sent to external servers except for ElevenLabs TTS generation.
                   </p>
+                </div>
+
+                <div className="space-y-4 p-4 border rounded-lg bg-slate-50/60">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex items-center gap-2">
+                      <Lock className="h-4 w-4 text-slate-600" />
+                      <div>
+                        <p className="font-medium">SSL Certificate</p>
+                        <p className="text-sm text-muted-foreground">
+                          Enable HTTPS with your PEM-formatted private key and certificate
+                        </p>
+                      </div>
+                    </div>
+                    <Switch
+                      checked={sslEnabled}
+                      onCheckedChange={(checked) => setValue("sslEnabled", checked)}
+                    />
+                  </div>
+
+                  <div className="rounded-lg border bg-white/70 p-3">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex items-center gap-2">
+                        {derivedSslStatus.httpsActive ? (
+                          <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                        ) : derivedSslStatus.enabled ? (
+                          <AlertTriangle className="h-4 w-4 text-amber-600" />
+                        ) : (
+                          <Lock className="h-4 w-4 text-slate-500" />
+                        )}
+                        <span className="font-medium">
+                          {derivedSslStatus.httpsActive
+                            ? 'HTTPS active'
+                            : derivedSslStatus.enabled
+                            ? 'Awaiting HTTPS activation'
+                            : 'HTTPS disabled'}
+                        </span>
+                      </div>
+                      <Badge variant={derivedSslStatus.enabled ? (derivedSslStatus.httpsActive ? 'default' : 'secondary') : 'outline'}>
+                        {derivedSslStatus.enabled ? 'Enabled' : 'Disabled'}
+                      </Badge>
+                    </div>
+                    <div className="mt-3 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
+                      <div>
+                        <span className="font-medium text-foreground">Configured:</span> {derivedSslStatus.configured ? 'Yes' : 'No'}
+                      </div>
+                      <div>
+                        <span className="font-medium text-foreground">Last applied:</span> {formatDateTime(derivedSslStatus.lastAppliedAt)}
+                      </div>
+                      {derivedSslStatus.subject && (
+                        <div className="sm:col-span-2">
+                          <span className="font-medium text-foreground">Subject:</span> {derivedSslStatus.subject}
+                        </div>
+                      )}
+                      {Array.isArray(derivedSslStatus.altNames) && derivedSslStatus.altNames.length > 0 && (
+                        <div className="sm:col-span-2">
+                          <span className="font-medium text-foreground">Alt names:</span> {derivedSslStatus.altNames.join(', ')}
+                        </div>
+                      )}
+                      {derivedSslStatus.validTo && (
+                        <div>
+                          <span className="font-medium text-foreground">Valid until:</span> {formatDateTime(derivedSslStatus.validTo)}
+                        </div>
+                      )}
+                      {derivedSslStatus.lastError && (
+                        <div className="sm:col-span-2 flex items-center gap-2 text-destructive">
+                          <AlertTriangle className="h-3 w-3" />
+                          <span>{derivedSslStatus.lastError}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-2 rounded-md border border-dashed border-slate-200 bg-white/60 p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="font-medium">Force HTTPS Redirect</p>
+                      <p className="text-xs text-muted-foreground">
+                        Automatically redirect HTTP traffic to HTTPS when SSL is enabled.
+                      </p>
+                    </div>
+                    <Switch
+                      checked={sslForceHttpsValue}
+                      disabled={!sslEnabled}
+                      onCheckedChange={(checked) => setValue("sslForceHttps", checked)}
+                    />
+                  </div>
+
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    <div>
+                      <label className="text-sm font-medium">Private Key (PEM)</label>
+                      <Textarea
+                        {...register("sslPrivateKey")}
+                        placeholder="-----BEGIN PRIVATE KEY-----"
+                        className="mt-1 font-mono text-xs"
+                        rows={6}
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Paste the complete PEM-encoded private key issued with your certificate.
+                      </p>
+                      {hasStoredPrivateKey && (
+                        <p className="text-xs text-muted-foreground">
+                          A private key is already stored securely. Leave unchanged to keep it.
+                        </p>
+                      )}
+                    </div>
+                    <div>
+                      <label className="text-sm font-medium">Certificate (PEM)</label>
+                      <Textarea
+                        {...register("sslCertificate")}
+                        placeholder="-----BEGIN CERTIFICATE-----"
+                        className="mt-1 font-mono text-xs"
+                        rows={6}
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Paste the PEM-encoded certificate for your Home Brain host.
+                      </p>
+                      {hasStoredCertificate && (
+                        <p className="text-xs text-muted-foreground">
+                          A certificate is already stored. Provide a new value to replace it.
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <label className="text-sm font-medium">Certificate Chain (optional)</label>
+                    <Textarea
+                      {...register("sslCertificateChain")}
+                      placeholder="Intermediate certificates"
+                      className="mt-1 font-mono text-xs"
+                      rows={4}
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Include any intermediate certificates required by your certificate authority.
+                    </p>
+                    {hasStoredChain && (
+                      <p className="text-xs text-muted-foreground">
+                        A certificate chain is already stored. Leave untouched to keep it.
+                      </p>
+                    )}
+                  </div>
                 </div>
               </CardContent>
             </Card>
