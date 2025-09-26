@@ -18,6 +18,18 @@ require('dotenv').config();
 const { createInsteonClient, normalizeBaseUrl } = require('./utils/insteonClient');
 const WebSocket = require('ws');
 
+const {
+  initializeUserStore,
+  verifyUserCredentials,
+  findUserByRefreshToken,
+  rotateRefreshToken,
+  sanitizeUser,
+  updateUser,
+  DEFAULT_ADMIN_EMAIL,
+  DEFAULT_PASSWORD_FROM_ENV,
+  revokeRefreshToken,
+} = require('./services/userStore');
+
 const SettingsModel = require('./models/Settings');
 let SecurityAlarmModel = null;
 let UserProfileModel = null;
@@ -1279,42 +1291,35 @@ const sendError = (res, status, message, details) => {
   if (details) body.details = details;
   return res.status(status).json(body);
 };
-const DEMO_USER = Object.freeze({
-  id: 'user-demo',
-  name: 'HomeBrain Demo',
-  role: 'admin',
+app.post('/api/auth/register', (_req, res) => {
+  return sendError(res, 403, 'Self-service account creation is disabled. Please contact the administrator.');
 });
-
-const buildDemoAuthResponse = (email = 'demo@homebrain.local') => {
-  const normalizedEmail = (email || 'demo@homebrain.local').toLowerCase();
-  return {
-    accessToken: `demo-access-${randomUUID()}`,
-    refreshToken: `demo-refresh-${randomUUID()}`,
-    user: { ...DEMO_USER, email: normalizedEmail },
-  };
-};
-
-app.get('/api/ping', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.post('/api/auth/register', asyncHandler(async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) {
-    return sendError(res, 400, 'Email is required');
-  }
-
-  const authPayload = buildDemoAuthResponse(email);
-  return sendSuccess(res, authPayload, 201);
-}));
 
 app.post('/api/auth/login', asyncHandler(async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) {
-    return sendError(res, 400, 'Email is required');
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return sendError(res, 400, 'Email and password are required');
   }
 
-  const authPayload = buildDemoAuthResponse(email);
+  const user = await verifyUserCredentials(email, password);
+  if (!user) {
+    return sendError(res, 401, 'Invalid email or password');
+  }
+
+  const loginAt = new Date().toISOString();
+  const updatedUser = updateUser(user.id, { lastLoginAt: loginAt, requiresPasswordChange: false });
+  const refreshToken = rotateRefreshToken(user.id);
+  if (!refreshToken) {
+    return sendError(res, 500, 'Unable to issue refresh token');
+  }
+
+  const accessToken = `hb-access-${randomUUID()}`;
+  const authPayload = {
+    accessToken,
+    refreshToken,
+    user: sanitizeUser(updatedUser || user),
+  };
+
   return sendSuccess(res, authPayload);
 }));
 
@@ -1324,11 +1329,31 @@ app.post('/api/auth/refresh', asyncHandler(async (req, res) => {
     return sendError(res, 400, 'refreshToken is required');
   }
 
-  const authPayload = buildDemoAuthResponse();
+  const user = findUserByRefreshToken(refreshToken);
+  if (!user || user.isActive === false) {
+    return sendError(res, 401, 'Invalid refresh token');
+  }
+
+  const nextRefreshToken = rotateRefreshToken(user.id);
+  if (!nextRefreshToken) {
+    return sendError(res, 500, 'Unable to refresh session');
+  }
+
+  const accessToken = `hb-access-${randomUUID()}`;
+  const authPayload = {
+    accessToken,
+    refreshToken: nextRefreshToken,
+    user: sanitizeUser(user),
+  };
+
   return sendSuccess(res, authPayload);
 }));
 
-app.post('/api/auth/logout', asyncHandler(async (_req, res) => {
+app.post('/api/auth/logout', asyncHandler(async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (refreshToken) {
+    revokeRefreshToken(refreshToken);
+  }
   return sendSuccess(res, { message: 'Logged out' });
 }));
 
@@ -2911,6 +2936,12 @@ const SETTINGS_DB_OPTIONS = { serverSelectionTimeoutMS: SETTINGS_DB_TIMEOUT_MS }
 
 
 async function startServer() {
+  await initializeUserStore();
+  if (!DEFAULT_PASSWORD_FROM_ENV) {
+    console.warn(`[Auth] Default admin account (${DEFAULT_ADMIN_EMAIL}) is using fallback credentials. Update HOMEBRAIN_ADMIN_PASSWORD to rotate immediately.`);
+  } else {
+    console.log(`[Auth] Default admin account ready: ${DEFAULT_ADMIN_EMAIL}`);
+  }
   await ensureSettingsLoaded();
   await refreshInsteonRuntime({ reason: 'startup' });
   if (SETTINGS_DB_URI) {
@@ -2960,10 +2991,3 @@ async function gracefulShutdown(signal) {
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-
-
-
-
-
-
-

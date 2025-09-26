@@ -1,51 +1,62 @@
 import { createContext, useContext, useState, ReactNode } from "react";
-import { login as apiLogin, register as apiRegister } from "../api/auth";
+import { login as apiLogin, logout as apiLogout } from "../api/auth";
 import { User } from "../../../shared/types/user";
 
 type AuthContextType = {
   isAuthenticated: boolean;
   currentUser: User | null;
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
+const loadStoredUser = (): User | null => {
+  const stored = localStorage.getItem("userData");
+  if (!stored) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(stored);
+    if (parsed?.email) {
+      return parsed;
+    }
+    if (parsed?.user?.email) {
+      return parsed.user;
+    }
+  } catch (error) {
+    console.warn("Failed to parse stored user data:", error);
+  }
+  return null;
+};
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [isAuthenticated, setIsAuthenticated] = useState(() => {
-    return !!localStorage.getItem("accessToken");
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    return Boolean(localStorage.getItem("accessToken"));
   });
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    const userData = localStorage.getItem("userData");
-    return userData ? JSON.parse(userData) : null;
-  });
+  const [currentUser, setCurrentUser] = useState<User | null>(() => loadStoredUser());
 
   const login = async (email: string, password: string) => {
     try {
       const response = await apiLogin(email, password);
-      const { accessToken, refreshToken, ...userData } = response;
-      setAuthData(accessToken, refreshToken, userData);
+      const { accessToken, refreshToken, user } = response;
+      setAuthData(accessToken, refreshToken, user);
     } catch (error) {
       resetAuth();
-      throw new Error(error?.message || 'Login failed');
+      throw new Error(error?.message || "Login failed");
     }
   };
 
-  const register = async (email: string, password: string) => {
-    try {
-      const response = await apiRegister(email, password);
-      const { accessToken, refreshToken, ...userData } = response;
-      setAuthData(accessToken, refreshToken, userData);
-    } catch (error) {
-      resetAuth();
-      throw new Error(error?.message || 'Registration failed');
-    }
-  };
-
-  const logout = () => {
+  const logout = async () => {
+    const refreshToken = localStorage.getItem("refreshToken") || undefined;
     resetAuth();
-    window.location.reload();
+    try {
+      await apiLogout(refreshToken);
+    } catch (error) {
+      console.warn("Logout error:", error?.message || error);
+    } finally {
+      window.location.reload();
+    }
   };
 
   const resetAuth = () => {
@@ -56,28 +67,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setIsAuthenticated(false);
   };
 
-  const setAuthData = (accessToken, refreshToken, userData) => {
-    if (accessToken || refreshToken) {
-      localStorage.setItem("refreshToken", refreshToken);
-      localStorage.setItem("accessToken", accessToken);
-      localStorage.setItem("userData", JSON.stringify(userData));
-      setCurrentUser(userData);
-      setIsAuthenticated(true);
-    } else {
-      throw new Error('Neither refreshToken nor accessToken was returned.');
+  const setAuthData = (accessToken: string, refreshToken: string, user: User) => {
+    if (!accessToken || !refreshToken || !user) {
+      throw new Error("Missing authentication tokens or user profile.");
     }
+
+    localStorage.setItem("refreshToken", refreshToken);
+    localStorage.setItem("accessToken", accessToken);
+    localStorage.setItem("userData", JSON.stringify(user));
+    setCurrentUser(user);
+    setIsAuthenticated(true);
   };
 
   return (
-      <AuthContext.Provider value={{
+    <AuthContext.Provider
+      value={{
         currentUser,
         isAuthenticated,
         login,
-        register,
-        logout
-      }}>
-        {children}
-      </AuthContext.Provider>
+        logout,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
   );
 }
 
@@ -88,4 +100,3 @@ export function useAuth() {
   }
   return context;
 }
-

@@ -3,7 +3,7 @@ import api from './api';
 // Description: Login user functionality
 // Endpoint: POST /api/auth/login
 // Request: { email: string, password: string }
-// Response: { accessToken: string, refreshToken: string }
+// Response: { accessToken: string, refreshToken: string, user: User }
 export const login = async (email: string, password: string) => {
   try {
     const response = await api.post('/api/auth/login', { email, password });
@@ -14,26 +14,13 @@ export const login = async (email: string, password: string) => {
   }
 };
 
-// Description: Register user functionality
-// Endpoint: POST /api/auth/register
-// Request: { email: string, password: string }
-// Response: { email: string }
-export const register = async (email: string, password: string) => {
-  try {
-    const response = await api.post('/api/auth/register', {email, password});
-    return response.data;
-  } catch (error) {
-    throw new Error(error?.response?.data?.message || error.message);
-  }
-};
-
 // Description: Logout
 // Endpoint: POST /api/auth/logout
-// Request: {}
+// Request: { refreshToken?: string }
 // Response: { success: boolean, message: string }
-export const logout = async () => {
+export const logout = async (refreshToken?: string) => {
   try {
-    return await api.post('/api/auth/logout');
+    return await api.post('/api/auth/logout', { refreshToken });
   } catch (error) {
     throw new Error(error?.response?.data?.message || error.message);
   }
