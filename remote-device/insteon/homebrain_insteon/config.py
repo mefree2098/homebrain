@@ -28,6 +28,7 @@ class BridgeConfig:
     device_cache_path: Path
     allow_mock_mode: bool
     mock_fallback_on_failure: bool
+    force_mock_mode: bool
     mock_device_cycle_seconds: float
     auth_token: Optional[str]
     websocket_event_buffer: int
@@ -46,6 +47,7 @@ class BridgeConfig:
         allow_mock_mode = _env_bool("INSTEON_ALLOW_MOCK", False)
         mock_fallback_on_failure = _env_bool("INSTEON_MOCK_FALLBACK", True)
         mock_device_cycle_seconds = float(os.getenv("INSTEON_MOCK_DEVICE_CYCLE_SECONDS", "15"))
+        force_mock_mode = _env_bool("INSTEON_FORCE_MOCK", False)
         auth_token = os.getenv("INSTEON_AUTH_TOKEN") or None
         websocket_event_buffer = int(os.getenv("INSTEON_WS_EVENT_BUFFER", "1000"))
         log_level = os.getenv("INSTEON_LOG_LEVEL", "INFO")
@@ -61,6 +63,7 @@ class BridgeConfig:
             device_cache_path=device_cache_path,
             allow_mock_mode=allow_mock_mode,
             mock_fallback_on_failure=mock_fallback_on_failure,
+            force_mock_mode=force_mock_mode,
             mock_device_cycle_seconds=mock_device_cycle_seconds,
             auth_token=auth_token,
             websocket_event_buffer=websocket_event_buffer,

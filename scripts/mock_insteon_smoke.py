@@ -19,6 +19,7 @@ from homebrain_insteon.config import BridgeConfig
 async def main() -> None:
     # Ensure mock mode is enabled even if the environment is not configured yet.
     os.environ.setdefault("INSTEON_ALLOW_MOCK", "1")
+    os.environ.setdefault("INSTEON_FORCE_MOCK", "1")
     config = BridgeConfig.from_env()
     if not config.allow_mock_mode:
         config = replace(config, allow_mock_mode=True)

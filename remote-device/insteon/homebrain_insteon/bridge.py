@@ -111,6 +111,12 @@ class InsteonBridge:
 
     # ------------------------------------------------------------------
     async def _connect_loop(self) -> None:
+        if self.config.allow_mock_mode and getattr(self.config, "force_mock_mode", False):
+            self.log.info("INSTEON_FORCE_MOCK=1 detected; starting mock runtime without touching pyinsteon")
+            await self._start_mock_runtime()
+            await self._stop_event.wait()
+            return
+
         if async_connect is None:
             if self.config.allow_mock_mode:
                 self.log.info("pyinsteon not installed; starting mock Insteon runtime")
