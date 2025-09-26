@@ -84,6 +84,75 @@ export function Settings() {
   const [disconnectingSmartThings, setDisconnectingSmartThings] = useState(false)
   const [sslStatus, setSslStatus] = useState<any>(null)
 
+  const form = useForm({
+    defaultValues: {
+      location: "New York, NY",
+      timezone: "America/New_York",
+      wakeWordSensitivity: 0.7,
+      voiceVolume: 0.8,
+      microphoneSensitivity: 0.6,
+      enableVoiceConfirmation: true,
+      enableNotifications: true,
+      insteonPort: "/dev/ttyUSB0",
+      smartthingsToken: "",
+      smartthingsClientId: "",
+      smartthingsClientSecret: "",
+      smartthingsRedirectUri: "",
+      elevenlabsApiKey: "",
+      llmProvider: "openai",
+      openaiApiKey: "",
+      openaiModel: "gpt-4",
+      anthropicApiKey: "",
+      anthropicModel: "claude-3-sonnet-20240229",
+      localLlmEndpoint: "http://localhost:8080",
+      localLlmModel: "llama2-7b",
+      enableSecurityMode: false,
+      sslEnabled: false,
+      sslForceHttps: false,
+      sslPrivateKey: "",
+      sslCertificate: "",
+      sslCertificateChain: ""
+    }
+  });
+  const { register, handleSubmit, setValue, watch, reset } = form;
+
+  const {
+    sslEnabled,
+    sslForceHttpsValue,
+    sslPrivateKeyValue,
+    sslCertificateValue,
+    sslChainValue,
+    hasStoredPrivateKey,
+    hasStoredCertificate,
+    hasStoredChain,
+    derivedSslStatus,
+  } = (() => {
+    const enabled = Boolean(watch('sslEnabled'))
+    const forceHttps = Boolean(watch('sslForceHttps'))
+    const privateKeyValue = watch('sslPrivateKey') ?? ''
+    const certificateValue = watch('sslCertificate') ?? ''
+    const chainValue = watch('sslCertificateChain') ?? ''
+    const storedPrivateKey = typeof privateKeyValue === 'string' && privateKeyValue.startsWith('\u0007')
+    const storedCertificate = typeof certificateValue === 'string' && certificateValue.startsWith('\u0007')
+    const storedChain = typeof chainValue === 'string' && chainValue.startsWith('\u0007')
+
+    const status = sslStatus
+      ? { ...sslStatus, enabled }
+      : { enabled, configured: storedPrivateKey && storedCertificate, httpsActive: false };
+
+    return {
+      sslEnabled: enabled,
+      sslForceHttpsValue: forceHttps,
+      sslPrivateKeyValue: privateKeyValue,
+      sslCertificateValue: certificateValue,
+      sslChainValue: chainValue,
+      hasStoredPrivateKey: storedPrivateKey,
+      hasStoredCertificate: storedCertificate,
+      hasStoredChain: storedChain,
+      derivedSslStatus: status,
+    }
+  })();
+
   const SENSITIVE_PLACEHOLDER = '\u0007'.repeat(32)
   const SENSITIVE_FIELDS = new Set([
     'elevenlabsApiKey',
@@ -95,17 +164,6 @@ export function Settings() {
     'sslCertificate',
     'sslCertificateChain'
   ])
-
-  const sslEnabled = watch('sslEnabled');
-  const sslForceHttpsValue = watch('sslForceHttps');
-  const sslPrivateKeyValue = watch('sslPrivateKey');
-  const sslCertificateValue = watch('sslCertificate');
-  const sslChainValue = watch('sslCertificateChain');
-  const hasStoredPrivateKey = typeof sslPrivateKeyValue === 'string' && sslPrivateKeyValue.startsWith('\u0007');
-  const hasStoredCertificate = typeof sslCertificateValue === 'string' && sslCertificateValue.startsWith('\u0007');
-  const hasStoredChain = typeof sslChainValue === 'string' && sslChainValue.startsWith('\u0007');
-
-  const derivedSslStatus = sslStatus ? { ...sslStatus, enabled: sslEnabled } : { enabled: sslEnabled, configured: hasStoredPrivateKey && hasStoredCertificate, httpsActive: false };
 
   const formatDateTime = (value?: string | null) => {
     if (!value) return '—';
@@ -1948,3 +2006,4 @@ export function Settings() {
     </div>
   )
 }
+
