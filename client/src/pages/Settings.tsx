@@ -189,37 +189,6 @@ export function Settings() {
   const [runningHealthCheck, setRunningHealthCheck] = useState(false)
   const [exportingConfig, setExportingConfig] = useState(false)
   const [healthData, setHealthData] = useState(null)
-  const { register, handleSubmit, setValue, watch, reset } = useForm({
-    defaultValues: {
-      location: "New York, NY",
-      timezone: "America/New_York",
-      wakeWordSensitivity: 0.7,
-      voiceVolume: 0.8,
-      microphoneSensitivity: 0.6,
-      enableVoiceConfirmation: true,
-      enableNotifications: true,
-      insteonPort: "/dev/ttyUSB0",
-      smartthingsToken: "",
-      smartthingsClientId: "",
-      smartthingsClientSecret: "",
-      smartthingsRedirectUri: "",
-      elevenlabsApiKey: "",
-      llmProvider: "openai",
-      openaiApiKey: "",
-      openaiModel: "gpt-4",
-      anthropicApiKey: "",
-      anthropicModel: "claude-3-sonnet-20240229",
-      localLlmEndpoint: "http://localhost:8080",
-      localLlmModel: "llama2-7b",
-      enableSecurityMode: false,
-      sslEnabled: false,
-      sslForceHttps: false,
-      sslPrivateKey: "",
-      sslCertificate: "",
-      sslCertificateChain: ""
-    }
-  })
-
   // Load settings on component mount
   useEffect(() => {
     const loadSettings = async () => {
