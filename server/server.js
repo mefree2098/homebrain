@@ -1557,6 +1557,15 @@ app.put('/api/settings', asyncHandler(async (req, res) => {
   await ensureSettingsLoaded();
   const updates = req.body || {};
   const merged = stripSensitivePlaceholders(updates, appSettings);
+  console.log('[Settings] SSL payload', {
+    hasKey: typeof updates.sslPrivateKey === 'string',
+    keyLength: typeof updates.sslPrivateKey === 'string' ? updates.sslPrivateKey.length : 0,
+    hasCert: typeof updates.sslCertificate === 'string',
+    certLength: typeof updates.sslCertificate === 'string' ? updates.sslCertificate.length : 0,
+    hasChain: typeof updates.sslCertificateChain === 'string',
+    chainLength: typeof updates.sslCertificateChain === 'string' ? updates.sslCertificateChain.length : 0,
+    sslEnabled: updates.sslEnabled,
+  });
 
   if (merged.sslEnabled !== undefined) {
     merged.sslEnabled = merged.sslEnabled === true || merged.sslEnabled === 'true' || merged.sslEnabled === 1 || merged.sslEnabled === '1';
