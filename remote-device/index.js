@@ -11,6 +11,15 @@ const { hideBin } = require('yargs/helpers');
 const dgram = require('dgram');
 const os = require('os');
 
+let Porcupine = null;
+let BuiltinKeyword = null;
+try {
+  ({ Porcupine, BuiltinKeyword } = require('@picovoice/porcupine-node'));
+} catch (error) {
+  Porcupine = null;
+  BuiltinKeyword = null;
+}
+
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
   .option('register', {
@@ -25,7 +34,7 @@ const argv = yargs(hideBin(process.argv))
     description: 'Path to configuration file'
   })
   .option('hub', {
-    alias: 'h',
+    alias: 'u',
     type: 'string',
     description: 'Hub URL (e.g., http://localhost:3000)'
   })
@@ -56,7 +65,6 @@ class HomeBrainRemoteDevice {
     this.ws = null;
     this.isConnected = false;
     this.isAuthenticated = false;
-    this.isRecording = false;
     this.isListening = false;
     this.deviceId = null;
     this.heartbeatInterval = null;
@@ -64,9 +72,31 @@ class HomeBrainRemoteDevice {
     this.maxReconnectAttempts = 10;
     this.speaker = null;
     this.recordingStream = null;
+    this.audioStream = null;
+    this.audioSampleRate = this.config.audio?.sampleRate || 16000;
+    this.audioChannels = this.config.audio?.channels || 1;
+    this.commandDurationMs = Number(this.config.commandDurationMs || 6000);
+    this.preRollMs = Number(this.config.preRollMs || 500);
+    this.silenceTimeoutMs = Number(this.config.silenceTimeoutMs || 1200);
+    this.silenceThreshold = Number(this.config.silenceThreshold || 0.02);
+    this.preRollBuffer = [];
+    this.preRollBytes = 0;
+    this.preRollMaxBytes = Math.floor(this.audioSampleRate * this.audioChannels * 2 * (this.preRollMs / 1000));
+    this.isStreaming = false;
+    this.streamStartedAt = null;
+    this.lastVoiceActivityAt = null;
+    this.activeAudioSessionId = null;
+    this.porcupine = null;
+    this.porcupineKeywords = [];
+    this.porcupineFrameBytes = 0;
+    this.porcupineFrameBuffer = Buffer.alloc(0);
+    this.mockWakeWord = Boolean(this.config.enableMockWakeWord);
 
     // Wake word detection (simplified for demo)
-    this.wakeWords = ['anna', 'henry', 'home brain', 'homebrain'];
+    const configuredWakeWords = Array.isArray(config.wakeWords) && config.wakeWords.length
+      ? config.wakeWords
+      : ['Anna', 'Henry', 'Home Brain', 'Homebrain'];
+    this.wakeWords = configuredWakeWords.map((word) => word.toLowerCase());
     this.isWakeWordListening = true;
 
     // Auto-discovery
@@ -137,9 +167,9 @@ class HomeBrainRemoteDevice {
     try {
       // Initialize speaker for TTS playback
       this.speaker = new Speaker({
-        channels: this.config.audio?.channels || 1,
+        channels: this.audioChannels,
         bitDepth: 16,
-        sampleRate: this.config.audio?.sampleRate || 16000,
+        sampleRate: this.audioSampleRate,
         device: this.config.audio?.playbackDevice || 'default'
       });
 
@@ -181,7 +211,9 @@ class HomeBrainRemoteDevice {
       this.deviceId = data.device._id;
       this.config.deviceId = this.deviceId;
       this.config.hubUrl = hubUrl;
-      this.config.hubWsUrl = data.hubUrl;
+      this.config.registrationCode = registrationCode;
+      const wsUrl = data.hubWsUrl || data.hubUrl || `${hubUrl.replace(/^http/, 'ws')}/ws/voice-device/${this.deviceId}`;
+      this.config.hubWsUrl = wsUrl;
 
       await this.saveConfig();
 
@@ -207,7 +239,8 @@ class HomeBrainRemoteDevice {
   }
 
   async connectToHub() {
-    const wsUrl = this.config.hubWsUrl || `ws://localhost:3000/ws/voice-device/${this.deviceId}`;
+    const hubUrl = this.config.hubUrl || argv.hub || 'http://localhost:3000';
+    const wsUrl = this.config.hubWsUrl || `${hubUrl.replace(/^http/, 'ws')}/ws/voice-device/${this.deviceId}`;
 
     console.log(`Connecting to hub: ${wsUrl}`);
 
@@ -297,12 +330,12 @@ class HomeBrainRemoteDevice {
 
         case 'wake_word_ack':
           console.log('Wake word acknowledged, listening for command...');
-          this.startVoiceRecording();
+          this.startAudioStreaming({ timeout: message.timeout, wakeWord: this.lastWakeWord });
 
           // Set timeout for voice command
           setTimeout(() => {
-            if (this.isRecording) {
-              this.stopVoiceRecording();
+            if (this.isStreaming) {
+              this.stopAudioStreaming('timeout');
             }
           }, message.timeout || 5000);
           break;
@@ -353,7 +386,14 @@ class HomeBrainRemoteDevice {
   updateConfig(config) {
     if (config.wakeWords) {
       this.wakeWords = config.wakeWords.map(w => w.toLowerCase());
+      this.config.wakeWords = config.wakeWords;
+      this.saveConfig();
       console.log(`Updated wake words: ${this.wakeWords.join(', ')}`);
+      if (this.porcupine && typeof this.porcupine.release === 'function') {
+        this.porcupine.release();
+      }
+      this.porcupine = null;
+      this.initializeWakeWordEngine();
     }
 
     if (config.volume !== undefined) {
@@ -363,32 +403,52 @@ class HomeBrainRemoteDevice {
     if (config.microphoneSensitivity !== undefined) {
       console.log(`Microphone sensitivity set to: ${config.microphoneSensitivity}%`);
     }
+
+    if (config.wakeWordSensitivity !== undefined) {
+      this.config.wakeWordSensitivity = Number(config.wakeWordSensitivity);
+      if (this.porcupine && typeof this.porcupine.release === 'function') {
+        this.porcupine.release();
+      }
+      this.porcupine = null;
+      this.initializeWakeWordEngine();
+    }
+
+    if (config.commandDurationMs) {
+      this.commandDurationMs = Number(config.commandDurationMs);
+    }
+    if (config.preRollMs) {
+      this.preRollMs = Number(config.preRollMs);
+      this.preRollMaxBytes = Math.floor(this.audioSampleRate * this.audioChannels * 2 * (this.preRollMs / 1000));
+    }
+    if (config.silenceTimeoutMs) {
+      this.silenceTimeoutMs = Number(config.silenceTimeoutMs);
+    }
+    if (config.silenceThreshold !== undefined) {
+      this.silenceThreshold = Number(config.silenceThreshold);
+    }
   }
 
   startWakeWordDetection() {
     console.log('Starting wake word detection...');
 
-    // Simple wake word detection using speech recognition
-    // In production, you would use Porcupine or similar
     this.isWakeWordListening = true;
+    this.initializeWakeWordEngine();
 
     try {
       this.recordingStream = recorder.record({
-        sampleRateHertz: this.config.audio?.sampleRate || 16000,
+        sampleRateHertz: this.audioSampleRate,
         threshold: 0.5,
         verbose: false,
         recordProgram: 'arecord',
         device: this.config.audio?.recordingDevice || 'default'
       });
 
-      this.recordingStream.stream().on('data', (data) => {
-        if (this.isWakeWordListening && !this.isRecording) {
-          this.processAudioForWakeWord(data);
-        }
+      this.audioStream = this.recordingStream.stream();
+      this.audioStream.on('data', (data) => {
+        this.handleAudioData(data);
       });
 
       console.log('Wake word detection active');
-
     } catch (error) {
       console.error('Failed to start wake word detection:', error.message);
       console.log('Running in test mode without audio input...');
@@ -398,13 +458,160 @@ class HomeBrainRemoteDevice {
     }
   }
 
-  processAudioForWakeWord(audioData) {
-    // Simplified wake word detection
-    // In production, integrate with Porcupine or other wake word engines
+  initializeWakeWordEngine() {
+    if (!Porcupine) {
+      console.warn('Porcupine not installed; wake word engine disabled.');
+      return;
+    }
 
-    // For demo purposes, we'll simulate wake word detection
-    if (Math.random() < 0.001) { // Very low probability for demo
-      this.onWakeWordDetected('anna', 0.85);
+    const accessKey = process.env.PV_ACCESS_KEY || process.env.PICOVOICE_ACCESS_KEY;
+    if (!accessKey) {
+      console.warn('Picovoice AccessKey not set (PV_ACCESS_KEY). Wake word engine disabled.');
+      return;
+    }
+
+    const builtinMap = {
+      alexa: BuiltinKeyword.ALEXA,
+      americano: BuiltinKeyword.AMERICANO,
+      blueberry: BuiltinKeyword.BLUEBERRY,
+      bumblebee: BuiltinKeyword.BUMBLEBEE,
+      computer: BuiltinKeyword.COMPUTER,
+      grapefruit: BuiltinKeyword.GRAPEFRUIT,
+      grasshopper: BuiltinKeyword.GRASSHOPPER,
+      hey_google: BuiltinKeyword.HEY_GOOGLE,
+      hey_siri: BuiltinKeyword.HEY_SIRI,
+      jarvis: BuiltinKeyword.JARVIS,
+      ok_google: BuiltinKeyword.OK_GOOGLE,
+      picovoice: BuiltinKeyword.PICOVOICE,
+      porcupine: BuiltinKeyword.PORCUPINE,
+      terminator: BuiltinKeyword.TERMINATOR,
+    };
+
+    const customModels = this.config.wakeWordModels || {};
+    const keywordDefs = [];
+
+    this.wakeWords.forEach((word) => {
+      const normalized = word.toLowerCase().replace(/\s+/g, '_');
+      const customPath = customModels[word] || customModels[normalized];
+      if (customPath) {
+        keywordDefs.push({ label: word, keyword: customPath });
+        return;
+      }
+      const builtin = builtinMap[normalized];
+      if (builtin !== undefined) {
+        keywordDefs.push({ label: word, keyword: builtin });
+      }
+    });
+
+    if (!keywordDefs.length) {
+      console.warn('No Porcupine keywords configured; wake word engine disabled.');
+      return;
+    }
+
+    const sensitivity = Number(this.config.wakeWordSensitivity || 0.5);
+    const sensitivities = keywordDefs.map(() => sensitivity);
+
+    try {
+      this.porcupine = new Porcupine(
+        accessKey,
+        keywordDefs.map((def) => def.keyword),
+        sensitivities
+      );
+      this.porcupineKeywords = keywordDefs.map((def) => def.label.toLowerCase());
+      this.porcupineFrameBytes = this.porcupine.frameLength * 2;
+      console.log(`Porcupine wake word engine ready (${this.porcupineKeywords.join(', ')})`);
+    } catch (error) {
+      console.warn('Failed to initialize Porcupine:', error.message);
+    }
+  }
+
+  handleAudioData(data) {
+    this.bufferPreRoll(data);
+
+    if (this.isStreaming) {
+      this.sendAudioChunk(data);
+      this.updateVoiceActivity(data);
+    }
+
+    if (this.isWakeWordListening && !this.isStreaming) {
+      this.processAudioForWakeWord(data);
+    }
+  }
+
+  bufferPreRoll(data) {
+    if (!this.preRollMaxBytes) {
+      return;
+    }
+
+    this.preRollBuffer.push(data);
+    this.preRollBytes += data.length;
+
+    while (this.preRollBytes > this.preRollMaxBytes && this.preRollBuffer.length) {
+      const removed = this.preRollBuffer.shift();
+      this.preRollBytes -= removed.length;
+    }
+  }
+
+  flushPreRoll() {
+    if (!this.preRollBuffer.length) {
+      return;
+    }
+    this.preRollBuffer.forEach((chunk) => {
+      this.sendAudioChunk(chunk);
+    });
+    this.preRollBuffer = [];
+    this.preRollBytes = 0;
+  }
+
+  updateVoiceActivity(data) {
+    const rms = this.calculateRms(data);
+    const now = Date.now();
+    if (rms >= this.silenceThreshold) {
+      this.lastVoiceActivityAt = now;
+      return;
+    }
+
+    if (this.lastVoiceActivityAt && now - this.lastVoiceActivityAt >= this.silenceTimeoutMs) {
+      this.stopAudioStreaming('silence');
+    }
+  }
+
+  calculateRms(buffer) {
+    let sum = 0;
+    const samples = Math.floor(buffer.length / 2);
+    if (samples === 0) {
+      return 0;
+    }
+    for (let i = 0; i < buffer.length; i += 2) {
+      const sample = buffer.readInt16LE(i) / 32768;
+      sum += sample * sample;
+    }
+    return Math.sqrt(sum / samples);
+  }
+
+  processAudioForWakeWord(audioData) {
+    if (this.porcupine) {
+      if (!this.porcupineFrameBytes) {
+        return;
+      }
+      this.porcupineFrameBuffer = Buffer.concat([this.porcupineFrameBuffer, audioData]);
+
+      while (this.porcupineFrameBuffer.length >= this.porcupineFrameBytes) {
+        const frame = this.porcupineFrameBuffer.subarray(0, this.porcupineFrameBytes);
+        this.porcupineFrameBuffer = this.porcupineFrameBuffer.subarray(this.porcupineFrameBytes);
+        const int16Frame = new Int16Array(frame.buffer, frame.byteOffset, frame.length / 2);
+        const keywordIndex = this.porcupine.process(int16Frame);
+        if (keywordIndex >= 0) {
+          const wakeWord = this.porcupineKeywords[keywordIndex] || 'wake-word';
+          this.onWakeWordDetected(wakeWord, 1.0);
+          break;
+        }
+      }
+      return;
+    }
+
+    if (this.mockWakeWord && Math.random() < 0.001) {
+      this.onWakeWordDetected(this.wakeWords[0] || 'anna', 0.85);
     }
   }
 
@@ -415,6 +622,7 @@ class HomeBrainRemoteDevice {
 
     this.stats.wakeWordsDetected++;
     this.lastInteraction = new Date();
+    this.lastWakeWord = wakeWord;
 
     this.sendMessage({
       type: 'wake_word_detected',
@@ -423,39 +631,84 @@ class HomeBrainRemoteDevice {
       timestamp: this.lastInteraction.toISOString()
     });
 
-    // Brief pause to prevent multiple detections
+    // Pause detection while we capture a command
     this.isWakeWordListening = false;
     setTimeout(() => {
-      this.isWakeWordListening = true;
-    }, 2000);
+      if (!this.isStreaming) {
+        this.isWakeWordListening = true;
+      }
+    }, this.commandDurationMs);
   }
 
   startVoiceRecording() {
-    if (this.isRecording) return;
-
-    console.log('Starting voice command recording...');
-    this.isRecording = true;
-
-    // In production, you would record audio and send to hub
-    // For demo, we'll simulate command input
-    setTimeout(() => {
-      const testCommands = [
-        'Turn on the living room lights',
-        'Set the temperature to 72 degrees',
-        'Lock all the doors',
-        'What\'s the weather like?'
-      ];
-
-      const command = testCommands[Math.floor(Math.random() * testCommands.length)];
-      this.onVoiceCommandRecorded(command, 0.9);
-    }, 2000);
+    this.startAudioStreaming({ timeout: this.commandDurationMs, wakeWord: this.lastWakeWord });
   }
 
   stopVoiceRecording() {
-    if (!this.isRecording) return;
+    this.stopAudioStreaming('manual');
+  }
 
-    console.log('Stopping voice command recording');
-    this.isRecording = false;
+  startAudioStreaming({ timeout, wakeWord } = {}) {
+    if (this.isStreaming) return;
+    if (!this.isAuthenticated) return;
+
+    this.isWakeWordListening = false;
+    this.isStreaming = true;
+    this.streamStartedAt = Date.now();
+    this.lastVoiceActivityAt = Date.now();
+    this.activeAudioSessionId = `${this.ensureDeviceId()}-${Date.now()}`;
+
+    this.sendMessage({
+      type: 'audio_start',
+      sessionId: this.activeAudioSessionId,
+      sampleRate: this.audioSampleRate,
+      channels: this.audioChannels,
+      format: 's16le',
+      wakeWord: wakeWord || null,
+      preRollMs: this.preRollMs,
+      timestamp: new Date().toISOString()
+    });
+
+    this.flushPreRoll();
+
+    setTimeout(() => {
+      if (this.isStreaming) {
+        this.stopAudioStreaming('timeout');
+      }
+    }, timeout || this.commandDurationMs);
+  }
+
+  stopAudioStreaming(reason = 'complete') {
+    if (!this.isStreaming) return;
+
+    this.isStreaming = false;
+    const sessionId = this.activeAudioSessionId;
+    this.activeAudioSessionId = null;
+
+    this.sendMessage({
+      type: 'audio_end',
+      sessionId,
+      reason,
+      durationMs: Date.now() - (this.streamStartedAt || Date.now()),
+      timestamp: new Date().toISOString()
+    });
+
+    this.streamStartedAt = null;
+    this.lastVoiceActivityAt = null;
+
+    setTimeout(() => {
+      this.isWakeWordListening = true;
+    }, 500);
+  }
+
+  sendAudioChunk(buffer) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (!this.activeAudioSessionId) {
+      return;
+    }
+    this.ws.send(buffer, { binary: true });
   }
 
   onVoiceCommandRecorded(command, confidence) {
@@ -893,8 +1146,26 @@ class HomeBrainRemoteDevice {
     return null;
   }
 
+  ensureDeviceId() {
+    if (this.deviceId) {
+      return this.deviceId;
+    }
+    if (this.config.deviceId) {
+      this.deviceId = this.config.deviceId;
+      return this.deviceId;
+    }
+
+    const mac = this.getMacAddress();
+    this.deviceId = mac
+      ? `pi-${mac.replace(/:/g, '')}`
+      : `device-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    this.config.deviceId = this.deviceId;
+    this.saveConfig();
+    return this.deviceId;
+  }
+
   generateDeviceId() {
-    return 'device-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+    return this.ensureDeviceId();
   }
 
   shutdown() {
@@ -929,7 +1200,13 @@ async function loadConfig() {
       channels: 1,
       recordingDevice: 'default',
       playbackDevice: 'default'
-    }
+    },
+    wakeWords: ['Anna', 'Henry', 'Home Brain'],
+    wakeWordSensitivity: 0.6,
+    commandDurationMs: 6000,
+    preRollMs: 500,
+    silenceTimeoutMs: 1200,
+    silenceThreshold: 0.02
   };
 
   try {

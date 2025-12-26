@@ -40,6 +40,49 @@ if [[ $EUID -eq 0 ]]; then
    exit 1
 fi
 
+# Default options
+HUB_URL="${HOMEBRAIN_HUB_URL:-}"
+SKIP_UPGRADE=false
+SKIP_AUDIO_CONFIG=false
+
+show_help() {
+    echo "Usage: $0 [--hub <url>] [--skip-upgrade] [--skip-audio-config]"
+    echo ""
+    echo "  --hub <url>           HomeBrain hub base URL (e.g., http://192.168.1.10:3000)"
+    echo "  --skip-upgrade        Skip full system upgrade to speed up install"
+    echo "  --skip-audio-config   Do not write /etc/asound.conf"
+    echo ""
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --hub)
+            HUB_URL="$2"
+            shift 2
+            ;;
+        --skip-upgrade)
+            SKIP_UPGRADE=true
+            shift
+            ;;
+        --skip-audio-config)
+            SKIP_AUDIO_CONFIG=true
+            shift
+            ;;
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        *)
+            print_warning "Unknown option: $1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$HUB_URL" ]]; then
+    HUB_URL="http://localhost:3000"
+fi
+
 # Detect system
 print_status "Detecting system..."
 OS=$(uname -s)
@@ -63,7 +106,11 @@ fi
 # Update system
 print_status "Updating system packages..."
 sudo apt-get update -y
-sudo apt-get upgrade -y
+if [[ "$SKIP_UPGRADE" != true ]]; then
+    sudo apt-get upgrade -y
+else
+    print_warning "Skipping full system upgrade (--skip-upgrade)"
+fi
 
 # Install required system packages
 print_status "Installing required system packages..."
@@ -75,11 +122,7 @@ sudo apt-get install -y \
     python3-pip \
     alsa-utils \
     pulseaudio \
-    portaudio19-dev \
-    libsndfile1-dev \
-    libasound2-dev \
-    sox \
-    libsox-fmt-all
+    libasound2-dev
 
 # Install Node.js (if not present)
 if ! command -v node &> /dev/null; then
@@ -93,8 +136,8 @@ fi
 
 # Verify Node.js version
 NODE_MAJOR=$(node --version | cut -d. -f1 | sed 's/v//')
-if [[ "$NODE_MAJOR" -lt 16 ]]; then
-    print_error "Node.js version 16 or higher is required"
+if [[ "$NODE_MAJOR" -lt 18 ]]; then
+    print_error "Node.js version 18 or higher is required"
     exit 1
 fi
 
@@ -115,51 +158,36 @@ if [[ -f "$(dirname "$0")/package.json" ]]; then
     print_status "Copying local files..."
     cp -r "$(dirname "$0")"/* .
 else
-    print_status "Downloading HomeBrain Remote Device..."
-    # In production, this would download from a repository
-    cat > package.json << 'EOF'
-{
-  "name": "homebrain-remote-device",
-  "version": "1.0.0",
-  "description": "HomeBrain Remote Voice Device for Raspberry Pi",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js",
-    "test": "node test-audio.js",
-    "setup-audio": "node setup-audio.js"
-  },
-  "dependencies": {
-    "ws": "^8.18.0",
-    "node-record-lpcm16": "^1.0.1",
-    "speaker": "^0.5.4",
-    "node-fetch": "^2.7.0",
-    "yargs": "^17.7.2",
-    "node-wav": "^0.0.2"
-  },
-  "optionalDependencies": {
-    "@picovoice/porcupine-node": "^3.0.2"
-  },
-  "engines": {
-    "node": ">=16.0.0"
-  }
-}
-EOF
+    print_status "Downloading HomeBrain Remote Device from ${HUB_URL}..."
+    if ! curl -fsSL "${HUB_URL}/api/remote-devices/files/package.json" -o package.json; then
+        print_error "Failed to download package.json from hub (${HUB_URL})"
+        exit 1
+    fi
+    if ! curl -fsSL "${HUB_URL}/api/remote-devices/files/index.js" -o index.js; then
+        print_error "Failed to download index.js from hub (${HUB_URL})"
+        exit 1
+    fi
 fi
 
 # Install Node.js dependencies
 print_status "Installing Node.js dependencies..."
-npm install
+npm install --omit=dev
 
 # Configure audio
 print_status "Configuring audio system..."
 
-# Create ALSA configuration
-sudo tee /etc/asound.conf > /dev/null << 'EOF'
+# Create ALSA configuration if requested and missing
+if [[ "$SKIP_AUDIO_CONFIG" == true ]]; then
+    print_warning "Skipping /etc/asound.conf configuration (--skip-audio-config)"
+elif [[ -f /etc/asound.conf ]]; then
+    print_warning "/etc/asound.conf already exists - leaving as-is"
+else
+    sudo tee /etc/asound.conf > /dev/null << 'EOF'
 # HomeBrain Remote Device Audio Configuration
 pcm.!default {
     type asym
     playback.pcm "plughw:0,0"
-    capture.pcm "plughw:1,0"
+    capture.pcm "plughw:0,0"
 }
 
 ctl.!default {
@@ -167,6 +195,7 @@ ctl.!default {
     card 0
 }
 EOF
+fi
 
 # Add user to audio group
 sudo usermod -a -G audio "$USER"
@@ -200,7 +229,7 @@ sudo systemctl daemon-reload
 
 # Create default configuration
 print_status "Creating default configuration..."
-cat > config.json << 'EOF'
+cat > config.json << EOF
 {
   "audio": {
     "sampleRate": 16000,
@@ -209,7 +238,13 @@ cat > config.json << 'EOF'
     "playbackDevice": "default"
   },
   "wakeWords": ["anna", "henry", "home brain"],
-  "hubUrl": null,
+  "wakeWordSensitivity": 0.6,
+  "commandDurationMs": 6000,
+  "preRollMs": 500,
+  "silenceTimeoutMs": 1200,
+  "silenceThreshold": 0.02,
+  "hubUrl": "${HUB_URL}",
+  "hubWsUrl": null,
   "deviceId": null,
   "registrationCode": null
 }
@@ -237,7 +272,7 @@ if [ -z "$1" ]; then
 fi
 
 REGISTRATION_CODE="$1"
-HUB_URL="${2:-http://localhost:3000}"
+HUB_URL="${2:-HUB_URL_PLACEHOLDER}"
 
 echo "Registering device with HomeBrain hub..."
 echo "Registration Code: $REGISTRATION_CODE"
@@ -245,6 +280,8 @@ echo "Hub URL: $HUB_URL"
 
 node index.js --register "$REGISTRATION_CODE" --hub "$HUB_URL"
 EOF
+
+sed -i "s|HUB_URL_PLACEHOLDER|${HUB_URL}|g" register.sh
 
 chmod +x register.sh
 

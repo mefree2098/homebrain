@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/yourusername/homebrain/main/scripts
 ### Remote Devices (Raspberry Pi)
 ```bash
 # Download and run the remote device installer
-curl -fsSL https://preview-0py18bcb.ui.pythagora.ai/api/remote-devices/setup | bash
+curl -fsSL http://<hub-ip>:3000/api/remote-devices/setup | bash -s -- --hub http://<hub-ip>:3000
 ```
 
 ## Architecture Overview

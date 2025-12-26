@@ -1,0 +1,13 @@
+[
+  {
+    "id": "user-32e66373-3f72-40e6-b778-0c620127eefa",
+    "email": "admin@homebrain.local",
+    "passwordHash": "$2b$12$/KJc3QOfWsWUGP7lH5v.Re4R9jw.JKmrZz38K7KRGPfthvHtfCD1W",
+    "role": "admin",
+    "isActive": true,
+    "createdAt": "2025-09-26T20:18:08.495Z",
+    "lastLoginAt": null,
+    "refreshToken": "b6770365-c50c-4078-a108-05b249733441",
+    "requiresPasswordChange": true
+  }
+]

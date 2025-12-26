@@ -9,11 +9,14 @@ try {
 }
 const morgan = require('morgan');
 const path = require('path');
+const os = require('os');
+const dgram = require('dgram');
 const mongoose = require('mongoose');
 const fs = require('fs');
 const fsPromises = fs.promises;
 const https = require('https');
 const tls = require('tls');
+const { spawn } = require('child_process');
 const crypto = require('crypto');
 const { randomUUID, X509Certificate } = crypto;
 require('dotenv').config();
@@ -217,6 +220,24 @@ const createMemoryStore = () => ({
 
 let memoryStore = createMemoryStore();
 
+const DISCOVERY_PORT = Number(process.env.HOMEBRAIN_DISCOVERY_PORT || 12345);
+const DISCOVERY_BROADCAST_INTERVAL_MS = Number(process.env.HOMEBRAIN_DISCOVERY_BROADCAST_MS || 15000);
+const REGISTRATION_CODE_TTL_MS = Number(process.env.HOMEBRAIN_REGISTRATION_TTL_MS || 24 * 60 * 60 * 1000);
+const HUB_ID = process.env.HOMEBRAIN_HUB_ID || generateId('hub');
+const HUB_NAME = process.env.HOMEBRAIN_HUB_NAME || os.hostname();
+
+let discoverySocket = null;
+let discoveryBroadcastTimer = null;
+
+const WHISPER_CPP_BIN = process.env.WHISPER_CPP_BIN || '';
+const WHISPER_CPP_MODEL = process.env.WHISPER_CPP_MODEL || '';
+const WHISPER_CPP_LANG = process.env.WHISPER_CPP_LANG || '';
+const WHISPER_CPP_THREADS = process.env.WHISPER_CPP_THREADS || '';
+const WHISPER_CPP_EXTRA_ARGS = process.env.WHISPER_CPP_EXTRA_ARGS || '';
+const MAX_AUDIO_SESSION_BYTES = Number(process.env.HOMEBRAIN_AUDIO_MAX_BYTES || 12 * 1024 * 1024);
+const AUDIO_TMP_DIR = path.join(__dirname, 'data', 'voice-audio');
+const audioSessions = new Map();
+
 let currentServerTransport = 'http';
 let httpServerInstance = null;
 let httpsServerInstance = null;
@@ -276,6 +297,635 @@ const DEFAULT_SETTINGS = {
 let appSettings = { ...DEFAULT_SETTINGS };
 let settingsLoaded = false;
 let settingsLoadPromise = null;
+
+const generateRegistrationCode = () => {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i += 1) {
+    code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return code;
+};
+
+const getLocalIpAddress = () => {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return null;
+};
+
+const getBroadcastAddresses = () => {
+  const interfaces = os.networkInterfaces();
+  const addresses = new Set();
+
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family !== 'IPv4' || iface.internal) {
+        continue;
+      }
+      const ip = iface.address.split('.').map(Number);
+      const netmask = iface.netmask.split('.').map(Number);
+      if (ip.length !== 4 || netmask.length !== 4) {
+        continue;
+      }
+      const broadcast = ip.map((octet, index) => octet | (255 - netmask[index]));
+      addresses.add(broadcast.join('.'));
+    }
+  }
+
+  addresses.add('255.255.255.255');
+  return Array.from(addresses);
+};
+
+const buildBaseUrl = (req) => {
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  const protocol = forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol;
+  return `${protocol}://${req.get('host')}`;
+};
+
+const mapRemoteDeviceToVoiceDevice = (device) => {
+  const lastSeenValue = device.lastHeartbeat || device.updatedAt || device.createdAt;
+  const lastSeen = lastSeenValue instanceof Date
+    ? lastSeenValue.toISOString()
+    : (typeof lastSeenValue === 'string' ? lastSeenValue : new Date().toISOString());
+
+  return ({
+  _id: device._id,
+  name: device.name,
+  room: device.room,
+  deviceType: device.deviceType || 'speaker',
+  status: device.status === 'online' ? 'online' : 'offline',
+  batteryLevel: device.batteryLevel ?? null,
+  powerSource: device.powerSource || 'wired',
+  connectionType: 'wifi',
+  ipAddress: device.ipAddress,
+  lastSeen,
+  uptime: device.uptime || 0,
+  microphoneSensitivity: Math.round((appSettings.microphoneSensitivity || DEFAULT_SETTINGS.microphoneSensitivity) * 100),
+  volume: Math.round((appSettings.voiceVolume || DEFAULT_SETTINGS.voiceVolume) * 100),
+  });
+};
+
+const findRemoteDevice = (deviceId) => memoryStore.remoteDevices.find((device) => device._id === deviceId);
+
+const updateRemoteDevice = (deviceId, updates) => {
+  const existing = findRemoteDevice(deviceId);
+  if (!existing) {
+    return null;
+  }
+  const sanitized = Object.fromEntries(Object.entries(updates || {}).filter(([, value]) => value !== undefined));
+  Object.assign(existing, sanitized, { updatedAt: new Date().toISOString() });
+  return existing;
+};
+
+const removeRemoteDevice = (deviceId) => {
+  const index = memoryStore.remoteDevices.findIndex((device) => device._id === deviceId);
+  if (index === -1) {
+    return null;
+  }
+  const [removed] = memoryStore.remoteDevices.splice(index, 1);
+  return removed;
+};
+
+const isRegistrationCodeExpired = (device) => {
+  if (!device || !device.registrationRequestedAt) {
+    return true;
+  }
+  const requestedAt = new Date(device.registrationRequestedAt).getTime();
+  return Number.isFinite(requestedAt) && Date.now() - requestedAt > REGISTRATION_CODE_TTL_MS;
+};
+
+const getMergedVoiceDevices = () => {
+  const baseDevices = Array.isArray(memoryStore.voiceDevices) ? deepClone(memoryStore.voiceDevices) : [];
+  const remoteDevices = Array.isArray(memoryStore.remoteDevices) ? memoryStore.remoteDevices.map(mapRemoteDeviceToVoiceDevice) : [];
+  const existingIds = new Set(baseDevices.map((device) => device._id));
+  const merged = baseDevices.concat(remoteDevices.filter((device) => !existingIds.has(device._id)));
+  return merged;
+};
+
+const ensureDiscoveryState = () => {
+  if (!memoryStore.discovery) {
+    memoryStore.discovery = { enabled: false, lastScan: null, autoApproveRooms: [], pendingDevices: [] };
+  }
+};
+
+const upsertPendingDevice = (payload, rinfo) => {
+  ensureDiscoveryState();
+  const pendingDevices = memoryStore.discovery.pendingDevices || [];
+  const deviceId = payload.deviceId || generateId('pending');
+  const existingIndex = pendingDevices.findIndex((device) => device.id === deviceId);
+  const entry = {
+    id: deviceId,
+    name: payload.name || `Remote Device ${deviceId}`,
+    type: payload.deviceType || 'speaker',
+    macAddress: payload.macAddress || null,
+    ipAddress: rinfo.address,
+    firmwareVersion: payload.firmwareVersion || payload.version || null,
+    capabilities: Array.isArray(payload.capabilities) ? payload.capabilities : [],
+    timestamp: new Date().toISOString(),
+    status: 'pending',
+  };
+
+  if (existingIndex >= 0) {
+    pendingDevices[existingIndex] = { ...pendingDevices[existingIndex], ...entry };
+  } else {
+    pendingDevices.push(entry);
+  }
+
+  memoryStore.discovery.pendingDevices = pendingDevices;
+  memoryStore.discovery.lastScan = new Date().toISOString();
+  return entry;
+};
+
+let discoveryAvailable = true;
+let discoveryLastError = null;
+
+const broadcastHubPresence = () => {
+  if (!discoverySocket) {
+    return;
+  }
+  const announcement = JSON.stringify({
+    type: 'homebrain_hub_announcement',
+    hubId: HUB_ID,
+    name: HUB_NAME,
+    port: PORT,
+    timestamp: new Date().toISOString(),
+  });
+  const targets = getBroadcastAddresses();
+  targets.forEach((address) => {
+    discoverySocket.send(announcement, 0, announcement.length, DISCOVERY_PORT, address, (err) => {
+      if (err && err.code !== 'ENETUNREACH') {
+        console.warn(`Discovery broadcast failed (${address}):`, err.message);
+      }
+    });
+  });
+};
+
+const handleDiscoveryMessage = (msg, rinfo) => {
+  let payload;
+  try {
+    payload = JSON.parse(msg.toString());
+  } catch (error) {
+    return;
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+
+  if (payload.type === 'homebrain_device_discovery') {
+    const response = JSON.stringify({
+      type: 'homebrain_hub_response',
+      hubId: HUB_ID,
+      name: HUB_NAME,
+      port: PORT,
+      timestamp: new Date().toISOString(),
+    });
+    discoverySocket.send(response, 0, response.length, rinfo.port, rinfo.address, () => {});
+    return;
+  }
+
+  if (payload.type === 'homebrain_device_connect') {
+    const entry = upsertPendingDevice(payload, rinfo);
+    const response = JSON.stringify({
+      type: 'homebrain_connect_response',
+      status: 'pending_approval',
+      deviceId: entry.id,
+      message: 'Awaiting approval',
+    });
+    discoverySocket.send(response, 0, response.length, rinfo.port, rinfo.address, () => {});
+  }
+};
+
+const startDiscoveryService = () => {
+  if (discoverySocket) {
+    return;
+  }
+  ensureDiscoveryState();
+  discoveryAvailable = true;
+  discoveryLastError = null;
+
+  const socket = dgram.createSocket('udp4');
+  socket.on('error', (err) => {
+    discoveryAvailable = false;
+    discoveryLastError = err.message;
+    console.warn('Discovery socket error:', err.message);
+    stopDiscoveryService();
+  });
+  socket.on('message', handleDiscoveryMessage);
+  socket.bind(DISCOVERY_PORT, () => {
+    socket.setBroadcast(true);
+    memoryStore.discovery.enabled = true;
+    memoryStore.discovery.lastScan = new Date().toISOString();
+    broadcastHubPresence();
+    if (discoveryBroadcastTimer) {
+      clearInterval(discoveryBroadcastTimer);
+    }
+    discoveryBroadcastTimer = setInterval(broadcastHubPresence, DISCOVERY_BROADCAST_INTERVAL_MS);
+  });
+
+  discoverySocket = socket;
+};
+
+const stopDiscoveryService = () => {
+  if (discoveryBroadcastTimer) {
+    clearInterval(discoveryBroadcastTimer);
+    discoveryBroadcastTimer = null;
+  }
+  if (discoverySocket) {
+    try {
+      discoverySocket.close();
+    } catch (error) {
+      console.warn('Failed to close discovery socket:', error.message);
+    }
+    discoverySocket = null;
+  }
+  ensureDiscoveryState();
+  memoryStore.discovery.enabled = false;
+};
+
+const getDiscoveryStats = () => {
+  ensureDiscoveryState();
+  return {
+    enabled: Boolean(memoryStore.discovery.enabled),
+    available: discoveryAvailable,
+    port: DISCOVERY_PORT,
+    pendingDevices: memoryStore.discovery.pendingDevices?.length || 0,
+    broadcastInterval: DISCOVERY_BROADCAST_INTERVAL_MS,
+    hubId: HUB_ID,
+    localIp: getLocalIpAddress(),
+    message: discoveryAvailable ? undefined : discoveryLastError || 'Discovery unavailable',
+  };
+};
+
+const ensureAudioTmpDir = () => {
+  if (!fs.existsSync(AUDIO_TMP_DIR)) {
+    fs.mkdirSync(AUDIO_TMP_DIR, { recursive: true });
+  }
+};
+
+const buildWavHeader = ({ dataLength, sampleRate, channels }) => {
+  const blockAlign = channels * 2;
+  const byteRate = sampleRate * blockAlign;
+  const buffer = Buffer.alloc(44);
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + dataLength, 4);
+  buffer.write('WAVE', 8);
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(byteRate, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(16, 34);
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(dataLength, 40);
+  return buffer;
+};
+
+const parseExtraArgs = (value) => {
+  if (!value) {
+    return [];
+  }
+  const matches = value.match(/(?:[^\s"]+|"[^"]*")+/g);
+  if (!matches) {
+    return [];
+  }
+  return matches.map((chunk) => chunk.replace(/^"(.*)"$/, '$1'));
+};
+
+const transcribeWithWhisperCpp = async (wavPath, outputBase) => {
+  if (!WHISPER_CPP_BIN || !WHISPER_CPP_MODEL) {
+    throw new Error('WHISPER_CPP_BIN and WHISPER_CPP_MODEL must be set');
+  }
+  if (!fs.existsSync(WHISPER_CPP_BIN)) {
+    throw new Error(`whisper.cpp binary not found at ${WHISPER_CPP_BIN}`);
+  }
+  if (!fs.existsSync(WHISPER_CPP_MODEL)) {
+    throw new Error(`whisper.cpp model not found at ${WHISPER_CPP_MODEL}`);
+  }
+
+  const args = ['-m', WHISPER_CPP_MODEL, '-f', wavPath, '-otxt', '-of', outputBase];
+  if (WHISPER_CPP_LANG) {
+    args.push('-l', WHISPER_CPP_LANG);
+  }
+  if (WHISPER_CPP_THREADS) {
+    args.push('-t', String(WHISPER_CPP_THREADS));
+  }
+  args.push(...parseExtraArgs(WHISPER_CPP_EXTRA_ARGS));
+
+  await new Promise((resolve, reject) => {
+    const proc = spawn(WHISPER_CPP_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+    proc.on('error', (error) => reject(error));
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(stderr || `whisper.cpp exited with code ${code}`));
+      }
+    });
+  });
+
+  const transcriptPath = `${outputBase}.txt`;
+  if (!fs.existsSync(transcriptPath)) {
+    throw new Error('Transcription output not found');
+  }
+  const text = fs.readFileSync(transcriptPath, 'utf-8').trim();
+  return text;
+};
+
+const transcribeAudio = async (wavPath, sessionId) => {
+  ensureAudioTmpDir();
+  const outputBase = path.join(AUDIO_TMP_DIR, `${sessionId}-transcript`);
+  return transcribeWithWhisperCpp(wavPath, outputBase);
+};
+
+const createAudioSession = (deviceId, message = {}) => {
+  const sessionId = message.sessionId || generateId('audio');
+  const sampleRate = Number(message.sampleRate || 16000);
+  const channels = Number(message.channels || 1);
+  const session = {
+    id: sessionId,
+    deviceId,
+    sampleRate,
+    channels,
+    format: message.format || 's16le',
+    wakeWord: message.wakeWord || null,
+    chunks: [],
+    bytes: 0,
+    startedAt: Date.now(),
+  };
+  audioSessions.set(sessionId, session);
+  return session;
+};
+
+const appendAudioChunk = (session, chunk) => {
+  if (!session) {
+    return false;
+  }
+  if (session.bytes + chunk.length > MAX_AUDIO_SESSION_BYTES) {
+    return false;
+  }
+  session.chunks.push(chunk);
+  session.bytes += chunk.length;
+  return true;
+};
+
+const finalizeAudioSession = async (ws, session, { reason = 'complete' } = {}) => {
+  if (!session) {
+    return;
+  }
+
+  ensureAudioTmpDir();
+  const pcmBuffer = Buffer.concat(session.chunks, session.bytes);
+  const wavHeader = buildWavHeader({
+    dataLength: pcmBuffer.length,
+    sampleRate: session.sampleRate,
+    channels: session.channels,
+  });
+  const wavPath = path.join(AUDIO_TMP_DIR, `${session.id}.wav`);
+  fs.writeFileSync(wavPath, Buffer.concat([wavHeader, pcmBuffer]));
+
+  ws.send(JSON.stringify({ type: 'command_processing', sessionId: session.id }));
+
+  try {
+    const transcript = await transcribeAudio(wavPath, session.id);
+    if (!transcript) {
+      throw new Error('No speech detected');
+    }
+
+    const commandEntry = {
+      _id: generateId('cmd'),
+      user: 'Unknown',
+      command: transcript,
+      deviceId: session.deviceId,
+      status: 'success',
+      timestamp: new Date().toISOString(),
+    };
+    memoryStore.voiceCommandHistory.push(commandEntry);
+
+    ws.send(JSON.stringify({
+      type: 'tts_response',
+      text: transcript,
+      voice: 'default',
+      sessionId: session.id,
+      reason,
+    }));
+  } catch (error) {
+    ws.send(JSON.stringify({
+      type: 'command_error',
+      message: error.message || 'Transcription failed',
+      sessionId: session.id,
+    }));
+  } finally {
+    audioSessions.delete(session.id);
+    try {
+      fs.unlinkSync(wavPath);
+    } catch (error) {
+      // ignore cleanup errors
+    }
+  }
+};
+
+const REMOTE_WS_PATH_PREFIX = '/ws/voice-device/';
+let remoteDeviceWsServer = null;
+
+const extractRemoteDeviceId = (url) => {
+  if (!url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url, 'http://localhost');
+    if (!parsed.pathname.startsWith(REMOTE_WS_PATH_PREFIX)) {
+      return null;
+    }
+    const deviceId = parsed.pathname.slice(REMOTE_WS_PATH_PREFIX.length);
+    return deviceId || null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const buildWsUrl = (baseUrl, deviceId) => {
+  if (!baseUrl || !deviceId) {
+    return null;
+  }
+  const wsBase = baseUrl.replace(/^http/, 'ws');
+  return `${wsBase}${REMOTE_WS_PATH_PREFIX}${deviceId}`;
+};
+
+const buildRemoteDeviceConfig = () => ({
+  wakeWords: ['Anna', 'Henry', 'Home Brain'],
+  volume: Math.round((appSettings.voiceVolume || DEFAULT_SETTINGS.voiceVolume) * 100),
+  microphoneSensitivity: Math.round((appSettings.microphoneSensitivity || DEFAULT_SETTINGS.microphoneSensitivity) * 100),
+  wakeWordSensitivity: appSettings.wakeWordSensitivity || DEFAULT_SETTINGS.wakeWordSensitivity,
+  commandDurationMs: 6000,
+  preRollMs: 500,
+  silenceTimeoutMs: 1200,
+  silenceThreshold: 0.02,
+});
+
+const attachRemoteDeviceWebSocket = (server) => {
+  if (remoteDeviceWsServer) {
+    try {
+      remoteDeviceWsServer.close();
+    } catch (error) {
+      console.warn('Failed to close remote device WebSocket server:', error.message);
+    }
+    remoteDeviceWsServer = null;
+  }
+
+  remoteDeviceWsServer = new WebSocket.Server({
+    server,
+    verifyClient: (info, done) => {
+      const deviceId = extractRemoteDeviceId(info.req.url);
+      if (!deviceId) {
+        return done(false, 400, 'Invalid remote device path');
+      }
+      const device = findRemoteDevice(deviceId);
+      if (!device) {
+        return done(false, 401, 'Device not approved');
+      }
+      return done(true);
+    },
+  });
+
+  remoteDeviceWsServer.on('connection', (ws, req) => {
+    const deviceId = extractRemoteDeviceId(req.url);
+    if (!deviceId) {
+      ws.close(1008, 'Invalid device');
+      return;
+    }
+
+    ws.deviceId = deviceId;
+    ws.isAuthenticated = false;
+    ws.activeAudioSessionId = null;
+
+    ws.send(JSON.stringify({
+      type: 'welcome',
+      deviceId,
+      hubId: HUB_ID,
+      timestamp: new Date().toISOString(),
+    }));
+
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) {
+        const sessionId = ws.activeAudioSessionId;
+        if (!sessionId) {
+          return;
+        }
+        const session = audioSessions.get(sessionId);
+        if (!session) {
+          return;
+        }
+        const ok = appendAudioChunk(session, Buffer.from(data));
+        if (!ok) {
+          ws.send(JSON.stringify({ type: 'command_error', message: 'Audio payload too large', sessionId }));
+          audioSessions.delete(sessionId);
+          ws.activeAudioSessionId = null;
+        }
+        return;
+      }
+
+      let message;
+      try {
+        message = JSON.parse(data.toString());
+      } catch (error) {
+        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON payload' }));
+        return;
+      }
+
+      const device = findRemoteDevice(deviceId);
+      if (!device) {
+        ws.send(JSON.stringify({ type: 'auth_failed', message: 'Device not registered' }));
+        ws.close(1008, 'Device not registered');
+        return;
+      }
+
+      if (!ws.isAuthenticated && message.type !== 'authenticate') {
+        ws.send(JSON.stringify({ type: 'auth_failed', message: 'Authenticate first' }));
+        return;
+      }
+
+      switch (message.type) {
+        case 'authenticate': {
+          ws.isAuthenticated = true;
+          updateRemoteDevice(deviceId, { status: 'online', lastHeartbeat: new Date().toISOString() });
+          ws.send(JSON.stringify({
+            type: 'auth_success',
+            config: buildRemoteDeviceConfig(),
+          }));
+          break;
+        }
+        case 'heartbeat': {
+          updateRemoteDevice(deviceId, {
+            status: 'online',
+            lastHeartbeat: new Date().toISOString(),
+            uptime: message.uptime || device.uptime || 0,
+            batteryLevel: message.batteryLevel ?? device.batteryLevel ?? null,
+            lastInteraction: message.lastInteraction || device.lastInteraction || null,
+          });
+          ws.send(JSON.stringify({ type: 'heartbeat_ack', timestamp: new Date().toISOString() }));
+          break;
+        }
+        case 'wake_word_detected': {
+          ws.send(JSON.stringify({ type: 'wake_word_ack', timeout: 6000 }));
+          break;
+        }
+        case 'audio_start': {
+          const session = createAudioSession(deviceId, message);
+          ws.activeAudioSessionId = session.id;
+          ws.send(JSON.stringify({ type: 'audio_ack', sessionId: session.id }));
+          break;
+        }
+        case 'audio_end': {
+          const sessionId = message.sessionId || ws.activeAudioSessionId;
+          if (!sessionId) {
+            ws.send(JSON.stringify({ type: 'command_error', message: 'Missing sessionId' }));
+            break;
+          }
+          const session = audioSessions.get(sessionId);
+          ws.activeAudioSessionId = null;
+          void finalizeAudioSession(ws, session, { reason: message.reason || 'complete' });
+          break;
+        }
+        case 'voice_command': {
+          const commandText = message.command || 'Unknown command';
+          ws.send(JSON.stringify({ type: 'command_processing' }));
+          setTimeout(() => {
+            ws.send(JSON.stringify({
+              type: 'tts_response',
+              text: `Received: ${commandText}`,
+              voice: 'default',
+            }));
+          }, 300);
+          break;
+        }
+        default: {
+          ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' }));
+        }
+      }
+    });
+
+    ws.on('close', () => {
+      updateRemoteDevice(deviceId, { status: 'offline' });
+      if (ws.activeAudioSessionId) {
+        audioSessions.delete(ws.activeAudioSessionId);
+        ws.activeAudioSessionId = null;
+      }
+    });
+  });
+};
 
 const isMaskedPlaceholderValue = (value) => {
   if (typeof value !== 'string') {
@@ -826,7 +1476,7 @@ const getMemoryStoreCounts = () => ({
   devices: memoryStore.devices.length,
   scenes: memoryStore.scenes.length,
   automations: memoryStore.automations.length,
-  voiceDevices: memoryStore.voiceDevices.length,
+  voiceDevices: getMergedVoiceDevices().length,
   userProfiles: memoryStore.userProfiles.length,
   voiceCommands: memoryStore.voiceCommandHistory.length,
   securityAlarms: memoryStore.security?.alarm ? 1 : 0,
@@ -2961,6 +3611,253 @@ app.delete('/api/automations/:id', asyncHandler(async (req, res) => {
   const [removed] = memoryStore.automations.splice(index, 1);
   return sendSuccess(res, { message: 'Automation deleted', automation: removed });
 }));
+
+app.post('/api/remote-devices/register', asyncHandler(async (req, res) => {
+  const { name, room, deviceType = 'speaker', macAddress = null } = req.body || {};
+  if (!name || !room) {
+    return sendError(res, 400, 'name and room are required');
+  }
+
+  const registrationCode = generateRegistrationCode();
+  const device = {
+    _id: generateId('remote'),
+    name: name.trim(),
+    room: room.trim(),
+    deviceType,
+    status: 'provisioning',
+    ipAddress: null,
+    macAddress,
+    firmwareVersion: null,
+    batteryLevel: null,
+    powerSource: 'wired',
+    uptime: 0,
+    lastHeartbeat: null,
+    registrationCode,
+    registrationRequestedAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  memoryStore.remoteDevices.push(device);
+  return sendSuccess(res, { device, registrationCode, message: 'Device registered' }, 201);
+}));
+
+app.post('/api/remote-devices/activate', asyncHandler(async (req, res) => {
+  const { registrationCode, ipAddress = null, firmwareVersion = null } = req.body || {};
+  if (!registrationCode) {
+    return sendError(res, 400, 'registrationCode is required');
+  }
+
+  const device = memoryStore.remoteDevices.find((item) => item.registrationCode === registrationCode);
+  if (!device) {
+    return sendError(res, 404, 'Registration code not found');
+  }
+
+  if (isRegistrationCodeExpired(device)) {
+    return sendError(res, 410, 'Registration code expired');
+  }
+
+  updateRemoteDevice(device._id, {
+    status: 'online',
+    ipAddress,
+    firmwareVersion,
+    lastHeartbeat: new Date().toISOString(),
+    registrationCode: null,
+    registrationRequestedAt: null,
+  });
+
+  const baseUrl = buildBaseUrl(req);
+  const wsUrl = buildWsUrl(baseUrl, device._id);
+  return sendSuccess(res, {
+    device,
+    hubUrl: wsUrl,
+    hubWsUrl: wsUrl,
+    message: 'Device activated',
+  });
+}));
+
+app.get('/api/remote-devices/:deviceId/config', asyncHandler(async (req, res) => {
+  const { deviceId } = req.params;
+  const device = findRemoteDevice(deviceId);
+  if (!device) {
+    return sendError(res, 404, 'Device not found');
+  }
+
+  return sendSuccess(res, { device, config: buildRemoteDeviceConfig() });
+}));
+
+app.post('/api/remote-devices/:deviceId/heartbeat', asyncHandler(async (req, res) => {
+  const { deviceId } = req.params;
+  const { status, batteryLevel, uptime, lastInteraction } = req.body || {};
+  const device = updateRemoteDevice(deviceId, {
+    status: status || 'online',
+    batteryLevel: batteryLevel ?? undefined,
+    uptime: uptime ?? undefined,
+    lastHeartbeat: new Date().toISOString(),
+    lastInteraction: lastInteraction || undefined,
+  });
+
+  if (!device) {
+    return sendError(res, 404, 'Device not found');
+  }
+
+  return sendSuccess(res, { message: 'Heartbeat recorded' });
+}));
+
+app.get('/api/remote-devices/setup-instructions', asyncHandler(async (req, res) => {
+  const baseUrl = buildBaseUrl(req);
+  const downloadUrl = `${baseUrl}/api/remote-devices/setup`;
+  const instructions = {
+    overview: 'Install the HomeBrain remote device runtime and pair it with this hub.',
+    requirements: [
+      'Raspberry Pi OS Lite (64-bit recommended)',
+      'Wi-Fi or Ethernet connectivity',
+      'USB microphone + speaker or I2S audio HAT',
+    ],
+    steps: [
+      {
+        title: 'Install runtime',
+        description: 'Download and run the installer from the HomeBrain hub.',
+        commands: [`curl -fsSL ${downloadUrl} | bash -s -- --hub ${baseUrl}`],
+      },
+      {
+        title: 'Register device',
+        description: 'Use the registration code from the hub UI.',
+        commands: ['cd ~/homebrain-remote', `npm start -- --register YOUR_CODE --hub ${baseUrl}`],
+      },
+    ],
+    downloadUrl,
+    configTemplate: {
+      hubUrl: baseUrl,
+      audioConfig: {
+        sampleRate: 16000,
+        channels: 1,
+        recordingDevice: 'default',
+        playbackDevice: 'default',
+      },
+    },
+  };
+
+  return sendSuccess(res, { instructions });
+}));
+
+app.get('/api/remote-devices/setup', asyncHandler(async (req, res) => {
+  const scriptPath = path.resolve(__dirname, '..', 'remote-device', 'install.sh');
+  if (!fs.existsSync(scriptPath)) {
+    return sendError(res, 404, 'Installer script not found');
+  }
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send(fs.readFileSync(scriptPath, 'utf-8'));
+}));
+
+app.get('/api/remote-devices/files/:name', asyncHandler(async (req, res) => {
+  const allowed = new Set(['index.js', 'package.json']);
+  const fileName = req.params.name;
+  if (!allowed.has(fileName)) {
+    return sendError(res, 404, 'File not found');
+  }
+  const filePath = path.resolve(__dirname, '..', 'remote-device', fileName);
+  if (!fs.existsSync(filePath)) {
+    return sendError(res, 404, 'File not found');
+  }
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.send(fs.readFileSync(filePath, 'utf-8'));
+}));
+
+app.delete('/api/remote-devices/:deviceId', asyncHandler(async (req, res) => {
+  const { deviceId } = req.params;
+  const removed = removeRemoteDevice(deviceId);
+  if (removed) {
+    return sendSuccess(res, { message: 'Device removed' });
+  }
+
+  const index = memoryStore.voiceDevices.findIndex((device) => device._id === deviceId);
+  if (index === -1) {
+    return sendError(res, 404, 'Device not found');
+  }
+  memoryStore.voiceDevices.splice(index, 1);
+  return sendSuccess(res, { message: 'Device removed' });
+}));
+
+app.post('/api/discovery/toggle', asyncHandler(async (req, res) => {
+  const { enabled } = req.body || {};
+  if (enabled) {
+    startDiscoveryService();
+  } else {
+    stopDiscoveryService();
+  }
+  return sendSuccess(res, { enabled: Boolean(memoryStore.discovery.enabled), message: enabled ? 'Auto-discovery enabled' : 'Auto-discovery disabled' });
+}));
+
+app.get('/api/discovery/status', asyncHandler(async (req, res) => {
+  return sendSuccess(res, { stats: getDiscoveryStats() });
+}));
+
+app.get('/api/discovery/pending', asyncHandler(async (req, res) => {
+  ensureDiscoveryState();
+  const devices = memoryStore.discovery.pendingDevices || [];
+  return sendSuccess(res, { devices, count: devices.length });
+}));
+
+app.post('/api/discovery/approve/:deviceId', asyncHandler(async (req, res) => {
+  ensureDiscoveryState();
+  const { deviceId } = req.params;
+  const { name, room, deviceType = 'speaker' } = req.body || {};
+  if (!name || !room) {
+    return sendError(res, 400, 'name and room are required');
+  }
+
+  const pendingDevices = memoryStore.discovery.pendingDevices || [];
+  const pendingIndex = pendingDevices.findIndex((device) => device.id === deviceId);
+  if (pendingIndex === -1) {
+    return sendError(res, 404, 'Pending device not found');
+  }
+  const pending = pendingDevices[pendingIndex];
+  pendingDevices.splice(pendingIndex, 1);
+  memoryStore.discovery.pendingDevices = pendingDevices;
+
+  const device = {
+    _id: deviceId,
+    name: name.trim(),
+    room: room.trim(),
+    deviceType,
+    status: 'offline',
+    ipAddress: pending.ipAddress,
+    macAddress: pending.macAddress,
+    firmwareVersion: pending.firmwareVersion,
+    batteryLevel: null,
+    powerSource: 'wired',
+    uptime: 0,
+    lastHeartbeat: null,
+    registrationCode: null,
+    registrationRequestedAt: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  memoryStore.remoteDevices.push(device);
+  return sendSuccess(res, { device, message: 'Device approved' });
+}));
+
+app.post('/api/discovery/reject/:deviceId', asyncHandler(async (req, res) => {
+  ensureDiscoveryState();
+  const { deviceId } = req.params;
+  const pendingDevices = memoryStore.discovery.pendingDevices || [];
+  const next = pendingDevices.filter((device) => device.id !== deviceId);
+  if (next.length === pendingDevices.length) {
+    return sendError(res, 404, 'Pending device not found');
+  }
+  memoryStore.discovery.pendingDevices = next;
+  return sendSuccess(res, { message: 'Device rejected' });
+}));
+
+app.post('/api/discovery/clear-pending', asyncHandler(async (req, res) => {
+  ensureDiscoveryState();
+  const count = memoryStore.discovery.pendingDevices?.length || 0;
+  memoryStore.discovery.pendingDevices = [];
+  return sendSuccess(res, { cleared: count, message: 'Pending devices cleared' });
+}));
+
 app.get('/api/voice/status', asyncHandler(async (req, res) => {
   if (isDbConnected()) {
     const devices = await VoiceDeviceModel.find().lean();
@@ -2978,7 +3875,7 @@ app.get('/api/voice/status', asyncHandler(async (req, res) => {
     });
   }
 
-  const devices = memoryStore.voiceDevices;
+  const devices = getMergedVoiceDevices();
   const online = devices.filter((device) => device.status === 'online').length;
   return sendSuccess(res, {
     listening: true,
@@ -2998,7 +3895,8 @@ app.get('/api/voice/devices', asyncHandler(async (req, res) => {
     return sendSuccess(res, { success: true, devices: docs, count: docs.length });
   }
 
-  return sendSuccess(res, { success: true, devices: deepClone(memoryStore.voiceDevices), count: memoryStore.voiceDevices.length });
+  const devices = getMergedVoiceDevices();
+  return sendSuccess(res, { success: true, devices, count: devices.length });
 }));
 
 app.post('/api/voice/test', asyncHandler(async (req, res) => {
@@ -3014,7 +3912,7 @@ app.post('/api/voice/test', asyncHandler(async (req, res) => {
         room = device.room;
       }
     } else {
-      const device = memoryStore.voiceDevices.find((item) => item._id === deviceId);
+      const device = getMergedVoiceDevices().find((item) => item._id === deviceId);
       if (device) {
         deviceName = device.name;
         room = device.room;
@@ -3043,7 +3941,11 @@ app.get('/api/voice/devices/:id', asyncHandler(async (req, res) => {
 
   const device = memoryStore.voiceDevices.find((item) => item._id === id);
   if (!device) {
-    return sendError(res, 404, 'Device not found');
+    const remote = findRemoteDevice(id);
+    if (!remote) {
+      return sendError(res, 404, 'Device not found');
+    }
+    return sendSuccess(res, { success: true, device: mapRemoteDeviceToVoiceDevice(remote) });
   }
   return sendSuccess(res, { success: true, device });
 }));
@@ -3064,11 +3966,16 @@ app.put('/api/voice/devices/:id/status', asyncHandler(async (req, res) => {
   }
 
   const device = memoryStore.voiceDevices.find((item) => item._id === id);
-  if (!device) {
+  if (device) {
+    device.status = status;
+    return sendSuccess(res, { success: true, message: 'Status updated', device });
+  }
+
+  const remote = updateRemoteDevice(id, { status });
+  if (!remote) {
     return sendError(res, 404, 'Device not found');
   }
-  device.status = status;
-  return sendSuccess(res, { success: true, message: 'Status updated', device });
+  return sendSuccess(res, { success: true, message: 'Status updated', device: mapRemoteDeviceToVoiceDevice(remote) });
 }));
 
 app.get('/api/voice/devices/room/:room', asyncHandler(async (req, res) => {
@@ -3078,7 +3985,7 @@ app.get('/api/voice/devices/room/:room', asyncHandler(async (req, res) => {
     return sendSuccess(res, { success: true, devices: docs, room, count: docs.length });
   }
 
-  const devices = memoryStore.voiceDevices.filter((device) => device.room === room);
+  const devices = getMergedVoiceDevices().filter((device) => device.room === room);
   return sendSuccess(res, { success: true, devices, room, count: devices.length });
 }));
 
@@ -3089,7 +3996,7 @@ app.get('/api/voice/devices/status/:status', asyncHandler(async (req, res) => {
     return sendSuccess(res, { success: true, devices: docs, status, count: docs.length });
   }
 
-  const devices = memoryStore.voiceDevices.filter((device) => device.status === status);
+  const devices = getMergedVoiceDevices().filter((device) => device.status === status);
   return sendSuccess(res, { success: true, devices, status, count: devices.length });
 }));
 
@@ -3129,6 +4036,7 @@ async function startHttpServer({ reason } = {}) {
       server.off('error', onError);
       currentServerTransport = 'http';
       httpServerInstance = server;
+      attachRemoteDeviceWebSocket(server);
       console.log(`HomeBrain API listening on http://${HOST}:${PORT}${reason ? ` (${reason})` : ''}`);
       resolve();
     });
@@ -3167,6 +4075,7 @@ async function startHttpsServer(credentials, { reason } = {}) {
       server.off('error', onError);
       httpsServerInstance = server;
       currentServerTransport = 'https';
+      attachRemoteDeviceWebSocket(server);
       console.log(`HomeBrain API listening on https://${HOST}:${PORT}${reason ? ` (${reason})` : ''}`);
       resolve();
     });
@@ -3228,6 +4137,9 @@ async function startServer() {
   await ensureSettingsLoaded();
   normalizeSslFields(appSettings);
   await refreshInsteonRuntime({ reason: 'startup' });
+  if (memoryStore.discovery?.enabled) {
+    startDiscoveryService();
+  }
   if (SETTINGS_DB_URI) {
     if (mongoose.connection.readyState === 0) {
       try {
@@ -3255,6 +4167,15 @@ startServer().catch((error) => {
 async function gracefulShutdown(signal) {
   console.log(`HomeBrain server received ${signal}; shutting down...`);
   await stopInsteonRuntime();
+  stopDiscoveryService();
+  if (remoteDeviceWsServer) {
+    try {
+      remoteDeviceWsServer.close();
+    } catch (error) {
+      console.warn('Failed to close remote device WebSocket server:', error.message);
+    }
+    remoteDeviceWsServer = null;
+  }
   try {
     writeUserProfilesToDisk(memoryStore.userProfiles);
   } catch (error) {

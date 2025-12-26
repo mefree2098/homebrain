@@ -1,0 +1,3 @@
+[Auth] Default admin account created for admin@homebrain.local. Update HOMEBRAIN_ADMIN_EMAIL and HOMEBRAIN_ADMIN_PASSWORD environment variables and rotate the password.
+[Auth] Default admin account (admin@homebrain.local) is using fallback credentials. Update HOMEBRAIN_ADMIN_PASSWORD to rotate immediately.
+Settings database connection failed; continuing with file persistence only. connect ECONNREFUSED ::1:27017, connect ECONNREFUSED 127.0.0.1:27017

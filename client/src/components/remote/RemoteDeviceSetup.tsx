@@ -41,6 +41,7 @@ export function RemoteDeviceSetup({ onDeviceRegistered }: RemoteDeviceSetupProps
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
   const [setupInstructions, setSetupInstructions] = useState<SetupInstructions | null>(null);
+  const defaultHubUrl = setupInstructions?.configTemplate?.hubUrl || window.location.origin;
 
   // Device registration form
   const [deviceName, setDeviceName] = useState("");
@@ -357,13 +358,13 @@ export function RemoteDeviceSetup({ onDeviceRegistered }: RemoteDeviceSetupProps
                         </p>
                         <div className="flex items-center gap-2">
                           <code className="text-xs bg-white dark:bg-gray-800 px-2 py-1 rounded flex-1 font-mono">
-                            npm start -- --register {registrationResult.registrationCode}
+                            npm start -- --register {registrationResult.registrationCode} --hub {defaultHubUrl}
                           </code>
                           <Button
                             size="sm"
                             variant="ghost"
                             onClick={() => copyToClipboard(
-                              `npm start -- --register ${registrationResult.registrationCode}`,
+                              `npm start -- --register ${registrationResult.registrationCode} --hub ${defaultHubUrl}`,
                               'Start command'
                             )}
                           >

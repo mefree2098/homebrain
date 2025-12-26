@@ -1,1 +1,3 @@
-HomeBrain API listening on http://0.0.0.0:3000
+No persisted user profiles found on disk; starting fresh.
+No persisted Insteon devices found on disk; starting fresh.
+HomeBrain API listening on http://0.0.0.0:3000 (startup)

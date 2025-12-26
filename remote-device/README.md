@@ -17,6 +17,7 @@ HomeBrain Remote Devices are Raspberry Pi-based voice-activated units that conne
 ## Hardware Requirements
 
 ### Supported Devices
+- **Raspberry Pi 5** (recommended - best performance)
 - **Raspberry Pi 4B** (recommended - best performance)
 - **Raspberry Pi Zero 2W** (compact option)
 - **Raspberry Pi 3B+** (legacy support)
@@ -58,7 +59,7 @@ HomeBrain Remote Devices are Raspberry Pi-based voice-activated units that conne
 ### Automated Installation
 ```bash
 # Download and run the installer
-curl -fsSL https://preview-0py18bcb.ui.pythagora.ai/api/remote-devices/setup | bash
+curl -fsSL http://<hub-ip>:3000/api/remote-devices/setup | bash -s -- --hub http://<hub-ip>:3000
 ```
 
 ### Manual Installation Steps
@@ -149,27 +150,38 @@ aplay test.wav
 #### Automatic Installation
 ```bash
 # Download and run installer
-curl -fsSL https://preview-0py18bcb.ui.pythagora.ai/api/remote-devices/setup | bash
+curl -fsSL http://<hub-ip>:3000/api/remote-devices/setup | bash -s -- --hub http://<hub-ip>:3000
 ```
 
 #### Manual Installation
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/homebrain.git
-cd homebrain/remote-device
+git clone https://github.com/homebrain/remote-device.git ~/homebrain-remote
+cd ~/homebrain-remote
 
 # Install Node.js 18
 curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
 sudo apt install -y nodejs
 
 # Install dependencies
-npm install
+npm install --omit=dev
 
-# Copy configuration template
-cp config.example.json config.json
-
-# Edit configuration
-nano config.json
+# Create configuration file
+cat > config.json << 'EOF'
+{
+  "audio": {
+    "sampleRate": 16000,
+    "channels": 1,
+    "recordingDevice": "default",
+    "playbackDevice": "default"
+  },
+  "wakeWords": ["anna", "henry", "home brain"],
+  "hubUrl": "http://<hub-ip>:3000",
+  "hubWsUrl": null,
+  "deviceId": null,
+  "registrationCode": null
+}
+EOF
 ```
 
 ### Step 4: Configure Device
@@ -284,7 +296,7 @@ Wants=network.target
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/homebrain/remote-device
+WorkingDirectory=/home/pi/homebrain-remote
 ExecStart=/usr/bin/npm start
 Restart=always
 RestartSec=10
@@ -323,7 +335,7 @@ sudo systemctl status homebrain-remote
 2. Create account and new wake word
 3. Train with voice samples
 4. Download `.ppn` file
-5. Place in `/home/pi/homebrain/remote-device/wake-words/`
+5. Place in `/home/pi/homebrain-remote/wake-words/`
 6. Update config.json with file path
 
 #### Configuration Example
@@ -331,14 +343,47 @@ sudo systemctl status homebrain-remote
 {
   "wakeWord": {
     "customModels": {
-      "Anna": "/home/pi/homebrain/remote-device/wake-words/anna.ppn",
-      "Henry": "/home/pi/homebrain/remote-device/wake-words/henry.ppn"
+      "Anna": "/home/pi/homebrain-remote/wake-words/anna.ppn",
+      "Henry": "/home/pi/homebrain-remote/wake-words/henry.ppn"
     },
     "enabled": ["Anna", "Henry"],
     "sensitivity": 0.7
   }
 }
 ```
+
+### Porcupine Wake Word Engine
+
+Porcupine runs locally on the Pi. Set your Picovoice access key before starting:
+
+```bash
+export PV_ACCESS_KEY="your_picovoice_access_key"
+```
+
+If you use custom `.ppn` files, add them to `config.json`:
+
+```json
+{
+  "wakeWordModels": {
+    "Anna": "/home/pi/homebrain-remote/wake-words/anna.ppn",
+    "Henry": "/home/pi/homebrain-remote/wake-words/henry.ppn"
+  },
+  "wakeWordSensitivity": 0.6
+}
+```
+
+### Whisper Transcription on the Hub
+
+HomeBrain expects the hub to run Whisper locally (recommended: `whisper.cpp`). Set these environment variables on the hub:
+
+```bash
+export WHISPER_CPP_BIN=/opt/whisper.cpp/main
+export WHISPER_CPP_MODEL=/opt/whisper.cpp/models/ggml-base.en.bin
+export WHISPER_CPP_LANG=en
+export WHISPER_CPP_THREADS=4
+```
+
+Restart the HomeBrain server after setting these values.
 
 ### Audio Optimization
 
@@ -400,7 +445,7 @@ echo "wireless-power off" | sudo tee -a /etc/network/interfaces
 ### Firmware Updates
 ```bash
 # Update remote device software
-cd /home/pi/homebrain/remote-device
+cd /home/pi/homebrain-remote
 git pull
 npm install
 sudo systemctl restart homebrain-remote
@@ -460,7 +505,7 @@ sudo systemctl status homebrain-remote
 journalctl -u homebrain-remote -n 50
 
 # Test manual startup
-cd /home/pi/homebrain/remote-device
+cd /home/pi/homebrain-remote
 npm start
 ```
 
